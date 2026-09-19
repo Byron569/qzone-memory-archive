@@ -233,39 +233,39 @@ const MAX_RECOVERY_EVIDENCE_ITEMS: usize = 100_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RecoveryEvidenceObservation {
-    kind: String,
-    source_side: String,
-    source_uin: String,
-    target_uin: Option<String>,
-    event_key: String,
-    cell_id: Option<String>,
-    event_type: i64,
-    event_time: i64,
-    title: Option<String>,
-    content: Option<String>,
-    event_summary: Option<String>,
-    actor_uin: Option<String>,
-    actor_name: Option<String>,
-    original_author_uin: Option<String>,
-    original_author_name: Option<String>,
-    picture_count: i64,
-    pictures_json: Option<String>,
-    video_json: Option<String>,
-    comments_json: Option<String>,
-    category: Option<String>,
-    raw_json: String,
+pub struct RecoveryEvidenceObservation {
+    pub kind: String,
+    pub source_side: String,
+    pub source_uin: String,
+    pub target_uin: Option<String>,
+    pub event_key: String,
+    pub cell_id: Option<String>,
+    pub event_type: i64,
+    pub event_time: i64,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub event_summary: Option<String>,
+    pub actor_uin: Option<String>,
+    pub actor_name: Option<String>,
+    pub original_author_uin: Option<String>,
+    pub original_author_name: Option<String>,
+    pub picture_count: i64,
+    pub pictures_json: Option<String>,
+    pub video_json: Option<String>,
+    pub comments_json: Option<String>,
+    pub category: Option<String>,
+    pub raw_json: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RecoveryEvidencePackage {
-    schema_version: u32,
-    package_id: String,
-    exporter_uin: String,
-    target_uin: Option<String>,
-    created_at: i64,
-    observations: Vec<RecoveryEvidenceObservation>,
+pub struct RecoveryEvidencePackage {
+    pub schema_version: u32,
+    pub package_id: String,
+    pub exporter_uin: String,
+    pub target_uin: Option<String>,
+    pub created_at: i64,
+    pub observations: Vec<RecoveryEvidenceObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4550,6 +4550,138 @@ pub fn import_recovery_evidence(
         imported_at: Some(stored_imported_at),
         item_count: item_count.max(0) as u64,
     })
+}
+
+fn store_recovery_evidence_package(
+    connection: &mut Connection,
+    package: &RecoveryEvidencePackage,
+) -> Result<RecoveryEvidencePackageSummary, String> {
+    validate_recovery_evidence_package(package)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始导入双端证据包失败：{error}"))?;
+    let imported_at = now();
+    transaction
+        .execute(
+            "INSERT INTO recovery_evidence_packages
+             (package_id,exporter_uin,target_uin,created_at,imported_at,item_count)
+             VALUES (?1,?2,?3,?4,?5,0)
+             ON CONFLICT(package_id) DO NOTHING",
+            params![
+                package.package_id,
+                package.exporter_uin,
+                package.target_uin,
+                package.created_at,
+                imported_at
+            ],
+        )
+        .map_err(|error| format!("保存双端证据包信息失败：{error}"))?;
+    let (stored_exporter, stored_created_at, stored_imported_at) = transaction
+        .query_row(
+            "SELECT exporter_uin,created_at,imported_at
+             FROM recovery_evidence_packages WHERE package_id=?1",
+            params![package.package_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("校验已导入双端证据包失败：{error}"))?;
+    if stored_exporter != package.exporter_uin || stored_created_at != package.created_at {
+        return Err("双端证据包编号与已有内容不一致，已拒绝导入".into());
+    }
+    for observation in &package.observations {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO recovery_evidence_items
+                 (package_id,kind,source_side,source_uin,target_uin,event_key,cell_id,event_type,
+                  event_time,title,content,event_summary,actor_uin,actor_name,original_author_uin,
+                  original_author_name,picture_count,pictures_json,video_json,comments_json,category,raw_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                params![
+                    package.package_id,
+                    observation.kind,
+                    observation.source_side,
+                    observation.source_uin,
+                    observation.target_uin,
+                    observation.event_key,
+                    observation.cell_id,
+                    observation.event_type,
+                    observation.event_time,
+                    observation.title,
+                    observation.content,
+                    observation.event_summary,
+                    observation.actor_uin,
+                    observation.actor_name,
+                    observation.original_author_uin,
+                    observation.original_author_name,
+                    observation.picture_count,
+                    observation.pictures_json,
+                    observation.video_json,
+                    observation.comments_json,
+                    observation.category,
+                    observation.raw_json,
+                ],
+            )
+            .map_err(|error| format!("保存双端证据记录失败：{error}"))?;
+    }
+    let item_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM recovery_evidence_items WHERE package_id=?1",
+            params![package.package_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计双端证据记录失败：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE recovery_evidence_packages SET item_count=?1 WHERE package_id=?2",
+            params![item_count, package.package_id],
+        )
+        .map_err(|error| format!("更新双端证据统计失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交双端证据包失败：{error}"))?;
+    Ok(RecoveryEvidencePackageSummary {
+        package_id: package.package_id.clone(),
+        exporter_uin: package.exporter_uin.clone(),
+        target_uin: package.target_uin.clone(),
+        created_at: package.created_at,
+        imported_at: Some(stored_imported_at),
+        item_count: item_count.max(0) as u64,
+    })
+}
+
+#[tauri::command]
+pub async fn prepare_recovery_sync_package(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    target_uin: String,
+) -> Result<RecoveryEvidencePackage, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let target_uin = target_uin.trim().to_owned();
+    if !valid_recovery_uin(&target_uin) || target_uin == owner_uin {
+        return Err("同步目标 QQ 号无效，或不能与当前登录账号相同".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let package = build_recovery_evidence_package(&connection, &owner_uin, Some(&target_uin))?;
+        validate_recovery_evidence_package(&package)?;
+        Ok(package)
+    })
+    .await
+    .map_err(|error| format!("准备远程同步证据失败：{error}"))?
+}
+
+#[tauri::command]
+pub fn import_recovery_sync_package(
+    app: tauri::AppHandle,
+    package: RecoveryEvidencePackage,
+) -> Result<RecoveryEvidencePackageSummary, String> {
+    let mut connection = open_database(&app)?;
+    store_recovery_evidence_package(&mut connection, &package)
 }
 
 #[tauri::command]

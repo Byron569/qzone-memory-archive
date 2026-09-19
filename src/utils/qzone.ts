@@ -71,12 +71,49 @@ export interface RecoveryEvidencePackageSummary {
   itemCount: number;
 }
 
+export interface RecoveryEvidenceObservation {
+  kind: "interaction" | "dynamic";
+  sourceSide: string;
+  sourceUin: string;
+  targetUin?: string | null;
+  eventKey: string;
+  cellId?: string | null;
+  eventType: number;
+  eventTime: number;
+  title?: string | null;
+  content?: string | null;
+  eventSummary?: string | null;
+  actorUin?: string | null;
+  actorName?: string | null;
+  originalAuthorUin?: string | null;
+  originalAuthorName?: string | null;
+  pictureCount: number;
+  picturesJson?: string | null;
+  videoJson?: string | null;
+  commentsJson?: string | null;
+  category?: string | null;
+  rawJson: string;
+}
+
+export interface RecoveryEvidenceSyncPackage {
+  schemaVersion: number;
+  packageId: string;
+  exporterUin: string;
+  targetUin?: string | null;
+  createdAt: number;
+  observations: RecoveryEvidenceObservation[];
+}
+
 export const exportRecoveryEvidence = (path: string, targetUin?: string) =>
   invoke<RecoveryEvidencePackageSummary>("export_recovery_evidence", { path, targetUin: targetUin || null });
 export const importRecoveryEvidence = (path: string) =>
   invoke<RecoveryEvidencePackageSummary>("import_recovery_evidence", { path });
 export const listRecoveryEvidencePackages = () =>
   invoke<RecoveryEvidencePackageSummary[]>("list_recovery_evidence_packages");
+export const prepareRecoverySyncPackage = (targetUin: string) =>
+  invoke<RecoveryEvidenceSyncPackage>("prepare_recovery_sync_package", { targetUin });
+export const importRecoverySyncPackage = (pkg: RecoveryEvidenceSyncPackage) =>
+  invoke<RecoveryEvidencePackageSummary>("import_recovery_sync_package", { package: pkg });
 
 /**
  * A record found in an imported evidence package that is not yet present in
