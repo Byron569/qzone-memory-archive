@@ -90,6 +90,8 @@ export interface RemotePullResponse {
   hasMore: boolean;
 }
 
+export const SYNC_SERVER_ENDPOINT = "https://byron569.online";
+
 export const getRemoteSyncConfig = () => invoke<RemoteSyncConfig>("get_remote_sync_config");
 export const saveRemoteSyncEndpoint = (endpoint: string) =>
   invoke<RemoteSyncConfig>("save_remote_sync_endpoint", { endpoint });
