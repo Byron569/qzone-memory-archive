@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,7 +17,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    registration_token: String,
+    registration_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -69,6 +69,7 @@ struct RegisterDeviceRequest {
     device_id: String,
     public_key: String,
     label: Option<String>,
+    account_uin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +77,8 @@ struct RegisterDeviceResponse {
     device_id: Uuid,
     device_token: String,
     created_at: DateTime<Utc>,
+    account_uin: Option<String>,
+    key_version: i32,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -86,6 +89,7 @@ struct DeviceResponse {
     label: Option<String>,
     created_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
+    account_uin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,12 +142,14 @@ struct EncryptedChangeInput {
     aad_b64: Option<String>,
     payload_digest: String,
     deleted_at: Option<i64>,
+    target_uin: Option<String>,
+    sender_key_version: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
 struct SyncCursorResponse {
     #[serde(rename = "streamId")]
-    stream_id: Uuid,
+    stream_id: String,
     position: String,
     #[serde(rename = "issuedAt")]
     issued_at: i64,
@@ -198,6 +204,8 @@ struct EncryptedChangeResponse {
     changed_at: i64,
     #[serde(rename = "deletedAt", skip_serializing_if = "Option::is_none")]
     deleted_at: Option<i64>,
+    #[serde(rename = "sourceUin", skip_serializing_if = "Option::is_none")]
+    source_uin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +241,7 @@ struct SyncItemRow {
     created_at: DateTime<Utc>,
     deleted_at: Option<DateTime<Utc>>,
     stream_position: i64,
+    source_uin: Option<String>,
 }
 
 #[tokio::main]
@@ -247,10 +256,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = required_env("DATABASE_URL")?;
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
-    let registration_token = required_env("REGISTRATION_TOKEN")?;
-    if registration_token.len() < 24 {
-        return Err("REGISTRATION_TOKEN 至少需要 24 个字符".into());
-    }
+    // REGISTRATION_TOKEN is optional: when set (>=24 chars) it gates device
+    // registration; when absent any device may register (account-level mode).
+    let registration_token = std::env::var("REGISTRATION_TOKEN")
+        .ok()
+        .filter(|value| value.len() >= 24);
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -274,6 +284,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(pull_changes).post(push_changes),
         )
         .route("/v1/pairings/{pairing_id}/ack", post(ack_changes))
+        .route(
+            "/v1/accounts/{account_uin}/public-keys",
+            get(list_account_public_keys),
+        )
+        .route(
+            "/v1/sync/changes",
+            get(pull_account_changes).post(push_account_changes),
+        )
+        .route("/v1/sync/ack", post(ack_account_changes))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -299,21 +319,44 @@ async fn register_device(
     headers: HeaderMap,
     Json(request): Json<RegisterDeviceRequest>,
 ) -> ApiResult<(StatusCode, Json<RegisterDeviceResponse>)> {
-    require_registration_token(&headers, &state.registration_token)?;
+    if let Some(token) = state.registration_token.as_deref() {
+        require_registration_token(&headers, token)?;
+    }
     validate_device_request(&request)?;
 
     let device_id = Uuid::new_v4();
     let device_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let token_hash = hash_secret(&device_token);
     let created_at = Utc::now();
+    let account_uin = request
+        .account_uin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut transaction = state.pool.begin().await?;
+
+    if let Some(requested) = account_uin {
+        let existing_account: Option<Option<String>> =
+            sqlx::query_scalar("SELECT account_uin FROM devices WHERE device_id = $1")
+                .bind(&request.device_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if let Some(existing) = existing_account.flatten() {
+            if existing != requested {
+                return Err(ApiError::new(StatusCode::CONFLICT, "设备已绑定其他账号"));
+            }
+        }
+    }
 
     let registered = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
-        "INSERT INTO devices (id, device_id, public_key, token_hash, label, created_at, last_seen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $6)
+        "INSERT INTO devices (id, device_id, public_key, token_hash, label, account_uin, created_at, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
          ON CONFLICT (device_id) DO UPDATE SET
            public_key = EXCLUDED.public_key,
            token_hash = EXCLUDED.token_hash,
            label = EXCLUDED.label,
+           account_uin = EXCLUDED.account_uin,
            last_seen_at = EXCLUDED.last_seen_at,
            revoked_at = NULL
          RETURNING id, created_at",
@@ -323,9 +366,51 @@ async fn register_device(
     .bind(&request.public_key)
     .bind(token_hash)
     .bind(request.label.as_deref())
+    .bind(account_uin)
     .bind(created_at)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await?;
+
+    let key_version = match account_uin {
+        Some(account_uin) => {
+            let existing: Option<i32> = sqlx::query_scalar(
+                "SELECT key_version FROM account_public_keys
+                 WHERE account_uin = $1 AND public_key = $2
+                 ORDER BY key_version DESC LIMIT 1",
+            )
+            .bind(account_uin)
+            .bind(&request.public_key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            match existing {
+                Some(version) => version,
+                None => {
+                    let version: i32 = sqlx::query_scalar(
+                        "SELECT COALESCE(MAX(key_version), 0) + 1 FROM account_public_keys WHERE account_uin = $1",
+                    )
+                    .bind(account_uin)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO account_public_keys (account_uin, key_version, device_id, public_key, label)
+                         VALUES ($1, $2, $3, $4, $5)
+                         ON CONFLICT (account_uin, key_version) DO NOTHING",
+                    )
+                    .bind(account_uin)
+                    .bind(version)
+                    .bind(device_id)
+                    .bind(&request.public_key)
+                    .bind(request.label.as_deref())
+                    .execute(&mut *transaction)
+                    .await?;
+                    version
+                }
+            }
+        }
+        None => 0,
+    };
+
+    transaction.commit().await?;
 
     Ok((
         StatusCode::CREATED,
@@ -333,6 +418,8 @@ async fn register_device(
             device_id: registered.0,
             device_token,
             created_at: registered.1,
+            account_uin: account_uin.map(str::to_owned),
+            key_version,
         }),
     ))
 }
@@ -611,7 +698,7 @@ async fn push_changes(
     Ok(Json(PushChangesResponse {
         accepted,
         rejected,
-        next_cursor: sync_cursor(pairing_id, current_position),
+        next_cursor: sync_cursor(&pairing_id.to_string(), current_position),
         conflicts,
     }))
 }
@@ -626,11 +713,13 @@ async fn pull_changes(
     let cursor = parse_cursor(query.cursor.as_deref())?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500) as i64;
     let rows = sqlx::query_as::<_, SyncItemRow>(
-        "SELECT event_key, operation, revision, key_version, payload, payload_nonce,
-                aad, content_digest, created_at, deleted_at, stream_position
-         FROM sync_items
-         WHERE pairing_id = $1 AND source_device_id <> $2 AND stream_position > $3
-         ORDER BY stream_position ASC
+        "SELECT s.event_key, s.operation, s.revision, s.key_version, s.payload,
+                s.payload_nonce, s.aad, s.content_digest, s.created_at, s.deleted_at,
+                s.stream_position, d.account_uin AS source_uin
+         FROM sync_items s
+         LEFT JOIN devices d ON d.id = s.source_device_id
+         WHERE s.pairing_id = $1 AND s.source_device_id <> $2 AND s.stream_position > $3
+         ORDER BY s.stream_position ASC
          LIMIT $4",
     )
     .bind(pairing_id)
@@ -657,7 +746,7 @@ async fn pull_changes(
 
     Ok(Json(PullChangesResponse {
         changes,
-        next_cursor: sync_cursor(pairing_id, next_position),
+        next_cursor: sync_cursor(&pairing_id.to_string(), next_position),
         has_more,
     }))
 }
@@ -707,6 +796,19 @@ struct DecodedChange {
 }
 
 fn decode_change(change: &EncryptedChangeInput) -> ApiResult<DecodedChange> {
+    if let Some(target_uin) = change
+        .target_uin
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        validate_account_uin(target_uin)?;
+    }
+    if let Some(sender_key_version) = change.sender_key_version {
+        if !(1..=100).contains(&sender_key_version) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "发送方密钥版本无效"));
+        }
+    }
     if change.record_id.trim().is_empty() || change.record_id.len() > 512 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "记录标识无效"));
     }
@@ -780,6 +882,7 @@ fn encrypted_change_response(row: SyncItemRow) -> EncryptedChangeResponseWithPos
             payload_digest: row.content_digest,
             changed_at: row.created_at.timestamp_millis(),
             deleted_at: row.deleted_at.map(|value| value.timestamp_millis()),
+            source_uin: row.source_uin,
         },
         stream_position: row.stream_position,
     }
@@ -825,9 +928,9 @@ fn parse_cursor(value: Option<&str>) -> ApiResult<i64> {
     Ok(position)
 }
 
-fn sync_cursor(pairing_id: Uuid, position: i64) -> SyncCursorResponse {
+fn sync_cursor(stream_id: &str, position: i64) -> SyncCursorResponse {
     SyncCursorResponse {
-        stream_id: pairing_id,
+        stream_id: stream_id.to_string(),
         position: position.to_string(),
         issued_at: Utc::now().timestamp_millis(),
     }
@@ -840,7 +943,7 @@ async fn authenticate(headers: &HeaderMap, pool: &PgPool) -> ApiResult<DeviceRes
         "UPDATE devices
          SET last_seen_at = now()
          WHERE token_hash = $1 AND revoked_at IS NULL
-         RETURNING id, device_id, public_key, label, created_at, last_seen_at",
+         RETURNING id, device_id, public_key, label, created_at, last_seen_at, account_uin",
     )
     .bind(token_hash)
     .fetch_optional(pool)
@@ -882,6 +985,14 @@ fn validate_device_request(request: &RegisterDeviceRequest) -> ApiResult<()> {
     {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备名称过长"));
     }
+    if let Some(account_uin) = request
+        .account_uin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_account_uin(account_uin)?;
+    }
     Ok(())
 }
 
@@ -910,4 +1021,334 @@ fn _warn_if_insecure_registration_token(token: &str) {
     if token.len() < 32 {
         warn!("registration token is shorter than the recommended 32 characters");
     }
+}
+
+// ---- Account-level auto sync (route by target QQ account) ----
+
+#[derive(Debug, Serialize)]
+struct AccountPublicKeyResponse {
+    #[serde(rename = "keyVersion")]
+    key_version: i32,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    #[serde(rename = "deviceId")]
+    device_id: Uuid,
+    label: Option<String>,
+    #[serde(rename = "registeredAt")]
+    registered_at: DateTime<Utc>,
+}
+
+fn validate_account_uin(account_uin: &str) -> ApiResult<()> {
+    let value = account_uin.trim();
+    if value.is_empty()
+        || value.len() > 32
+        || !value.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "账号标识无效"));
+    }
+    Ok(())
+}
+
+async fn list_account_public_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_uin): Path<String>,
+) -> ApiResult<Json<Vec<AccountPublicKeyResponse>>> {
+    let _device = authenticate(&headers, &state.pool).await?;
+    validate_account_uin(&account_uin)?;
+    let rows = sqlx::query_as::<_, (i32, String, Uuid, Option<String>, DateTime<Utc>)>(
+        "SELECT k.key_version, k.public_key, k.device_id, k.label, k.registered_at
+         FROM account_public_keys k
+         JOIN devices d ON d.id = k.device_id
+         WHERE k.account_uin = $1 AND d.revoked_at IS NULL
+         ORDER BY k.key_version DESC",
+    )
+    .bind(&account_uin)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(key_version, public_key, device_id, label, registered_at)| {
+                    AccountPublicKeyResponse {
+                        key_version,
+                        public_key,
+                        device_id,
+                        label,
+                        registered_at,
+                    }
+                },
+            )
+            .collect(),
+    ))
+}
+
+async fn push_account_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PushChangesRequest>,
+) -> ApiResult<Json<PushChangesResponse>> {
+    let device = authenticate(&headers, &state.pool).await?;
+    let account_uin = device
+        .account_uin
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "设备尚未绑定账号"))?;
+    if request.changes.is_empty() || request.changes.len() > 100 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "每次上传需要包含 1 到 100 条变更",
+        ));
+    }
+    let target_uin = request
+        .changes
+        .first()
+        .and_then(|change| change.target_uin.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "同步变更缺少目标账号"))?
+        .to_owned();
+    if target_uin == account_uin {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "不能向自己账号同步"));
+    }
+    if request
+        .changes
+        .iter()
+        .any(|change| change.target_uin.as_deref().map(str::trim) != Some(target_uin.as_str()))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "同一批变更必须发给同一目标账号",
+        ));
+    }
+    validate_account_uin(&target_uin)?;
+
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO account_streams (account_uin, next_position)
+         VALUES ($1, 1)
+         ON CONFLICT (account_uin) DO NOTHING",
+    )
+    .bind(&target_uin)
+    .execute(&mut *transaction)
+    .await?;
+
+    let mut accepted = 0;
+    let mut rejected = 0;
+    let mut conflicts = Vec::new();
+
+    for change in request.changes {
+        let decoded = decode_change(&change)?;
+        let existing = sqlx::query_as::<_, ExistingSyncItem>(
+            "SELECT revision, content_digest
+             FROM sync_items
+             WHERE target_uin = $1 AND event_key = $2
+             FOR UPDATE",
+        )
+        .bind(&target_uin)
+        .bind(&change.record_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(existing) = existing {
+            if change.revision < existing.revision {
+                rejected += 1;
+                conflicts.push(SyncConflictResponse {
+                    record_id: change.record_id,
+                    local_revision: existing.revision,
+                    remote_revision: change.revision,
+                    local_digest: existing.content_digest,
+                    remote_digest: change.payload_digest,
+                });
+                continue;
+            }
+            if change.revision == existing.revision {
+                if change.payload_digest == existing.content_digest {
+                    accepted += 1;
+                    continue;
+                }
+                rejected += 1;
+                conflicts.push(SyncConflictResponse {
+                    record_id: change.record_id,
+                    local_revision: existing.revision,
+                    remote_revision: change.revision,
+                    local_digest: existing.content_digest,
+                    remote_digest: change.payload_digest,
+                });
+                continue;
+            }
+        }
+
+        let stream_position = sqlx::query_scalar::<_, i64>(
+            "UPDATE account_streams
+             SET next_position = next_position + 1, updated_at = now()
+             WHERE account_uin = $1
+             RETURNING next_position - 1",
+        )
+        .bind(&target_uin)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO sync_items (
+                 id, pairing_id, target_uin, event_key, source_device_id, payload, payload_nonce,
+                 content_digest, revision, operation, key_version, aad, deleted_at,
+                 stream_position
+             ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             ON CONFLICT (target_uin, event_key) DO UPDATE SET
+                 source_device_id = EXCLUDED.source_device_id,
+                 payload = EXCLUDED.payload,
+                 payload_nonce = EXCLUDED.payload_nonce,
+                 content_digest = EXCLUDED.content_digest,
+                 revision = EXCLUDED.revision,
+                 operation = EXCLUDED.operation,
+                 key_version = EXCLUDED.key_version,
+                 aad = EXCLUDED.aad,
+                 deleted_at = EXCLUDED.deleted_at,
+                 created_at = now(),
+                 stream_position = EXCLUDED.stream_position",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&target_uin)
+        .bind(&change.record_id)
+        .bind(device.id)
+        .bind(decoded.ciphertext)
+        .bind(decoded.nonce)
+        .bind(&change.payload_digest)
+        .bind(change.revision)
+        .bind(&change.operation)
+        .bind(change.key_version)
+        .bind(decoded.aad)
+        .bind(decoded.deleted_at)
+        .bind(stream_position)
+        .execute(&mut *transaction)
+        .await?;
+
+        if change.operation == "tombstone" {
+            sqlx::query(
+                "INSERT INTO tombstones (id, pairing_id, target_uin, event_key, source_device_id)
+                 VALUES ($1, NULL, $2, $3, $4)
+                 ON CONFLICT (target_uin, event_key) DO UPDATE SET
+                   source_device_id = EXCLUDED.source_device_id,
+                   created_at = now()",
+            )
+            .bind(Uuid::new_v4())
+            .bind(&target_uin)
+            .bind(&change.record_id)
+            .bind(device.id)
+            .execute(&mut *transaction)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM tombstones WHERE target_uin = $1 AND event_key = $2")
+                .bind(&target_uin)
+                .bind(&change.record_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        accepted += 1;
+    }
+
+    let current_position = sqlx::query_scalar::<_, i64>(
+        "SELECT next_position - 1 FROM account_streams WHERE account_uin = $1",
+    )
+    .bind(&target_uin)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(Json(PushChangesResponse {
+        accepted,
+        rejected,
+        next_cursor: sync_cursor(&target_uin, current_position),
+        conflicts,
+    }))
+}
+
+async fn pull_account_changes(
+    State(state): State<AppState>,
+    Query(query): Query<PullChangesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<PullChangesResponse>> {
+    let device = authenticate(&headers, &state.pool).await?;
+    let account_uin = device
+        .account_uin
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "设备尚未绑定账号"))?;
+    let cursor = parse_cursor(query.cursor.as_deref())?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as i64;
+    let rows = sqlx::query_as::<_, SyncItemRow>(
+        "SELECT s.event_key, s.operation, s.revision, s.key_version, s.payload,
+                s.payload_nonce, s.aad, s.content_digest, s.created_at, s.deleted_at,
+                s.stream_position, d.account_uin AS source_uin
+         FROM sync_items s
+         LEFT JOIN devices d ON d.id = s.source_device_id
+         WHERE s.target_uin = $1 AND s.source_device_id <> $2 AND s.stream_position > $3
+         ORDER BY s.stream_position ASC
+         LIMIT $4",
+    )
+    .bind(account_uin)
+    .bind(device.id)
+    .bind(cursor)
+    .bind(limit + 1)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let has_more = rows.len() > limit as usize;
+    let wrapped_changes = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(encrypted_change_response)
+        .collect::<Vec<_>>();
+    let next_position = wrapped_changes
+        .last()
+        .map(|change| change.stream_position)
+        .unwrap_or(cursor);
+    let changes = wrapped_changes
+        .into_iter()
+        .map(|change| change.change)
+        .collect::<Vec<_>>();
+
+    Ok(Json(PullChangesResponse {
+        changes,
+        next_cursor: sync_cursor(account_uin, next_position),
+        has_more,
+    }))
+}
+
+async fn ack_account_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AckChangesRequest>,
+) -> ApiResult<StatusCode> {
+    let device = authenticate(&headers, &state.pool).await?;
+    let account_uin = device
+        .account_uin
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "设备尚未绑定账号"))?;
+    let position = parse_cursor(Some(&request.cursor))?;
+    let max_position = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(stream_position), 0) FROM sync_items WHERE target_uin = $1",
+    )
+    .bind(account_uin)
+    .fetch_one(&state.pool)
+    .await?;
+    if position > max_position {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "同步游标超出当前流位置",
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO account_sync_cursors (account_uin, device_id, last_position, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (account_uin, device_id) DO UPDATE SET
+           last_position = GREATEST(account_sync_cursors.last_position, EXCLUDED.last_position),
+           updated_at = now()",
+    )
+    .bind(account_uin)
+    .bind(device.id)
+    .bind(position)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

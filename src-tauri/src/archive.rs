@@ -536,7 +536,23 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            FOREIGN KEY(package_id) REFERENCES recovery_evidence_packages(package_id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS idx_recovery_evidence_items_match
-           ON recovery_evidence_items(source_uin,cell_id,event_type,event_time);",
+           ON recovery_evidence_items(source_uin,cell_id,event_type,event_time);
+         CREATE TABLE IF NOT EXISTS remote_sync_upload_state (
+           owner_uin TEXT NOT NULL,
+           target_uin TEXT NOT NULL,
+           event_key TEXT NOT NULL,
+           package_id TEXT NOT NULL,
+           peer_pubkey TEXT NOT NULL,
+           sent_at INTEGER NOT NULL,
+           PRIMARY KEY(owner_uin, target_uin, event_key)
+         );
+         CREATE TABLE IF NOT EXISTS remote_sync_pull_cursors (
+           account_uin TEXT PRIMARY KEY,
+           cursor_position TEXT NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_evidence_items_dedup
+           ON recovery_evidence_items(source_uin,target_uin,kind,event_key);",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
     if connection
@@ -6253,4 +6269,429 @@ mod tests {
         );
         assert_eq!(skip_probe_offsets(20), vec![20, 32, 64, 128, 256]);
     }
+}
+
+// ---- Account-level auto sync (route observations by target QQ account) ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSyncChunk {
+    pub package: RecoveryEvidencePackage,
+    pub has_more: bool,
+    pub next_event_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSyncState {
+    pub account_uin: Option<String>,
+    pub registered: bool,
+    pub last_sync_at: Option<i64>,
+    pub uploaded_count: u64,
+    pub pending_count: u64,
+    pub pull_cursor: Option<String>,
+}
+
+fn routed_target_for_observation(
+    owner_uin: &str,
+    observation: &RecoveryEvidenceObservation,
+) -> Option<String> {
+    if observation.kind == "interaction" {
+        if let Some(actor) = observation.actor_uin.as_deref() {
+            if !actor.trim().is_empty() && actor != owner_uin {
+                return Some(actor.to_string());
+            }
+        }
+        if let Some(author) = observation.original_author_uin.as_deref() {
+            if !author.trim().is_empty() && author != owner_uin {
+                return Some(author.to_string());
+            }
+        }
+    } else if observation.kind == "dynamic" {
+        if let Some(author) = observation.original_author_uin.as_deref() {
+            if !author.trim().is_empty() && author != owner_uin {
+                return Some(author.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 本账号互动记录涉及的所有"相关方 QQ 号"（去重），供自动同步循环遍历。
+#[tauri::command]
+pub async fn list_remote_sync_targets(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<String>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let mut targets = std::collections::HashSet::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT actor_uin, original_author_uin FROM archive_feeds
+                 WHERE owner_uin=?1 AND (actor_uin IS NOT NULL OR original_author_uin IS NOT NULL)",
+            )
+            .map_err(|error| format!("准备同步目标查询失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(|error| format!("查询同步目标失败：{error}"))?;
+        for row in rows {
+            let (actor, author) = row.map_err(|error| format!("读取同步目标失败：{error}"))?;
+            for value in [actor, author].into_iter().flatten() {
+                let value = value.trim();
+                if valid_recovery_uin(value) && value != owner_uin {
+                    targets.insert(value.to_string());
+                }
+            }
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT author_uin FROM archive_dynamics WHERE owner_uin=?1 AND author_uin IS NOT NULL",
+            )
+            .map_err(|error| format!("准备动态作者查询失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("查询动态作者失败：{error}"))?;
+        for row in rows {
+            let author = row.map_err(|error| format!("读取动态作者失败：{error}"))?;
+            if valid_recovery_uin(&author) && author != owner_uin {
+                targets.insert(author);
+            }
+        }
+        let mut sorted: Vec<String> = targets.into_iter().collect();
+        sorted.sort();
+        Ok(sorted)
+    })
+    .await
+    .map_err(|error| format!("查询远程同步目标失败：{error}"))?
+}
+
+fn load_uploaded_event_keys(
+    connection: &Connection,
+    owner_uin: &str,
+    target_uin: &str,
+    peer_pubkey: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_key FROM remote_sync_upload_state
+             WHERE owner_uin=?1 AND target_uin=?2 AND peer_pubkey=?3",
+        )
+        .map_err(|error| format!("准备已上传证据查询失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin, target_uin, peer_pubkey], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| format!("查询已上传证据失败：{error}"))?;
+    let mut keys = std::collections::HashSet::new();
+    for row in rows {
+        keys.insert(row.map_err(|error| format!("读取已上传证据失败：{error}"))?);
+    }
+    Ok(keys)
+}
+
+/// 按目标账号生成一批"未上传"的互动/动态证据，支持分页与断点续传。
+/// peer_pubkey 用于检测对端换钥：公钥变化时会重新生成全部证据（重传）。
+#[tauri::command]
+pub async fn prepare_auto_sync_chunk(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    target_uin: String,
+    peer_pubkey: String,
+    limit: u32,
+    before_event_key: Option<String>,
+) -> Result<AutoSyncChunk, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let target_uin = target_uin.trim().to_owned();
+    if !valid_recovery_uin(&target_uin) || target_uin == owner_uin {
+        return Err("同步目标 QQ 号无效，或不能与当前登录账号相同".into());
+    }
+    let limit = limit.clamp(1, 1000) as usize;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let uploaded = load_uploaded_event_keys(&connection, &owner_uin, &target_uin, &peer_pubkey)?;
+        let mut pending: Vec<(String, RecoveryEvidenceObservation)> = Vec::new();
+
+        let mut feeds = connection
+            .prepare(
+                "SELECT feed_key,cell_id,event_type,event_time,title,content,event_summary,
+                        actor_uin,actor_name,original_author_uin,original_author_name,picture_count,
+                        pictures_json,video_json,comments_json,raw_json
+                 FROM archive_feeds WHERE owner_uin=?1 AND (actor_uin=?2 OR original_author_uin=?2)
+                 ORDER BY event_time DESC,id DESC",
+            )
+            .map_err(|error| format!("准备互动记录查询失败：{error}"))?;
+        let feed_rows = feeds
+            .query_map(params![owner_uin, target_uin], |row| {
+                Ok(RecoveryEvidenceObservation {
+                    kind: "interaction".into(),
+                    source_side: "owner".into(),
+                    source_uin: owner_uin.to_string(),
+                    target_uin: None,
+                    event_key: format!("feed:{}", row.get::<_, String>(0)?),
+                    cell_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    event_time: row.get(3)?,
+                    title: row.get(4)?,
+                    content: row.get(5)?,
+                    event_summary: row.get(6)?,
+                    actor_uin: row.get(7)?,
+                    actor_name: row.get(8)?,
+                    original_author_uin: row.get(9)?,
+                    original_author_name: row.get(10)?,
+                    picture_count: row.get(11)?,
+                    pictures_json: row.get(12)?,
+                    video_json: row.get(13)?,
+                    comments_json: row.get(14)?,
+                    category: None,
+                    raw_json: row.get(15)?,
+                })
+            })
+            .map_err(|error| format!("查询互动记录失败：{error}"))?;
+        for row in feed_rows {
+            let mut observation =
+                row.map_err(|error| format!("读取互动记录失败：{error}"))?;
+            observation.target_uin = Some(target_uin.clone());
+            let event_key = observation.event_key.clone();
+            if uploaded.contains(&event_key) {
+                continue;
+            }
+            if routed_target_for_observation(&owner_uin, &observation).as_deref() != Some(target_uin.as_str()) {
+                continue;
+            }
+            pending.push((event_key, observation));
+        }
+
+        let mut dynamics = connection
+            .prepare(
+                "SELECT cell_id,published_at,content,author_uin,author_name,category,
+                        pictures_json,video_json,raw_original_json
+                 FROM archive_dynamics WHERE owner_uin=?1 AND author_uin=?2
+                 ORDER BY published_at DESC,id DESC",
+            )
+            .map_err(|error| format!("准备原动态查询失败：{error}"))?;
+        let dynamic_rows = dynamics
+            .query_map(params![owner_uin, target_uin], |row| {
+                let cell_id = row.get::<_, String>(0)?;
+                let author_uin = row.get::<_, Option<String>>(3)?;
+                let author_name = row.get::<_, Option<String>>(4)?;
+                Ok(RecoveryEvidenceObservation {
+                    kind: "dynamic".into(),
+                    source_side: "owner".into(),
+                    source_uin: owner_uin.to_string(),
+                    target_uin: None,
+                    event_key: format!("dynamic:{cell_id}"),
+                    cell_id: Some(cell_id),
+                    event_type: 0,
+                    event_time: row.get(1)?,
+                    title: None,
+                    content: row.get(2)?,
+                    event_summary: None,
+                    actor_uin: author_uin.clone(),
+                    actor_name: author_name.clone(),
+                    original_author_uin: author_uin,
+                    original_author_name: author_name,
+                    picture_count: 0,
+                    pictures_json: row.get(6)?,
+                    video_json: row.get(7)?,
+                    comments_json: None,
+                    category: row.get(5)?,
+                    raw_json: row.get(8)?,
+                })
+            })
+            .map_err(|error| format!("查询原动态失败：{error}"))?;
+        for row in dynamic_rows {
+            let mut observation = row.map_err(|error| format!("读取原动态失败：{error}"))?;
+            observation.target_uin = Some(target_uin.clone());
+            let event_key = observation.event_key.clone();
+            if uploaded.contains(&event_key) {
+                continue;
+            }
+            if routed_target_for_observation(&owner_uin, &observation).as_deref() != Some(target_uin.as_str()) {
+                continue;
+            }
+            pending.push((event_key, observation));
+        }
+
+        pending.sort_by(|a, b| {
+            b.1.event_time
+                .cmp(&a.1.event_time)
+                .then_with(|| b.0.cmp(&a.0))
+        });
+
+        let start = match before_event_key.as_deref() {
+            Some(key) => pending
+                .iter()
+                .position(|(event_key, _)| event_key == key)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let end = (start + limit).min(pending.len());
+        let has_more = end < pending.len();
+        let next_event_key = if has_more {
+            Some(pending[end].0.clone())
+        } else {
+            None
+        };
+        let chunk_observations: Vec<RecoveryEvidenceObservation> = pending[start..end]
+            .iter()
+            .map(|(_, observation)| observation.clone())
+            .collect();
+
+        let created_at = now();
+        let package_id = format!(
+            "qza-sync-{owner_uin}-{target_uin}-{:016x}",
+            stable_feed_hash(&json!({
+                "ownerUin": owner_uin,
+                "targetUin": target_uin,
+                "firstKey": chunk_observations.first().map(|item| item.event_key.clone()).unwrap_or_default(),
+                "createdAt": created_at,
+            }))
+        );
+        let package = RecoveryEvidencePackage {
+            schema_version: RECOVERY_EVIDENCE_SCHEMA_VERSION,
+            package_id,
+            exporter_uin: owner_uin.clone(),
+            target_uin: Some(target_uin.clone()),
+            created_at,
+            observations: chunk_observations,
+        };
+        validate_recovery_evidence_package(&package)?;
+        Ok(AutoSyncChunk {
+            package,
+            has_more,
+            next_event_key,
+        })
+    })
+    .await
+    .map_err(|error| format!("准备自动同步证据失败：{error}"))?
+}
+
+/// 上传成功后标记事件已同步（记录对端公钥，换钥时自动重传）。
+#[tauri::command]
+pub async fn mark_remote_evidence_uploaded(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    target_uin: String,
+    package_id: String,
+    peer_pubkey: String,
+    event_keys: Vec<String>,
+) -> Result<u64, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    if event_keys.is_empty() {
+        return Ok(0);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        for key in event_keys.iter() {
+            let updated = connection
+                .execute(
+                    "UPDATE remote_sync_upload_state
+                     SET package_id=?4, peer_pubkey=?5, sent_at=?6
+                     WHERE owner_uin=?1 AND target_uin=?2 AND event_key=?3",
+                    params![owner_uin, target_uin, key, package_id, peer_pubkey, now()],
+                )
+                .map_err(|error| format!("更新已上传证据失败：{error}"))?;
+            if updated == 0 {
+                connection
+                    .execute(
+                        "INSERT OR IGNORE INTO remote_sync_upload_state
+                         (owner_uin, target_uin, event_key, package_id, peer_pubkey, sent_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![owner_uin, target_uin, key, package_id, peer_pubkey, now()],
+                    )
+                    .map_err(|error| format!("记录已上传证据失败：{error}"))?;
+            }
+        }
+        Ok(event_keys.len() as u64)
+    })
+    .await
+    .map_err(|error| format!("标记已上传证据失败：{error}"))?
+}
+
+/// 保存拉取游标（账号级，本地持久化）。
+#[tauri::command]
+pub async fn save_remote_pull_cursor(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    cursor: String,
+) -> Result<(), String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let cursor = cursor.trim().to_owned();
+    if cursor.is_empty() {
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        connection
+            .execute(
+                "INSERT INTO remote_sync_pull_cursors (account_uin, cursor_position, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_uin) DO UPDATE SET cursor_position=?2, updated_at=?3",
+                params![owner_uin, cursor, now()],
+            )
+            .map_err(|error| format!("保存同步游标失败：{error}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("保存同步游标失败：{error}"))?
+}
+
+/// 读取本地远程同步状态（已上传数、待上传数、游标等）。
+#[tauri::command]
+pub async fn get_remote_sync_state(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<RemoteSyncState, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let uploaded_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM remote_sync_upload_state WHERE owner_uin=?1",
+                params![owner_uin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("统计已上传证据失败：{error}"))?;
+        let pending_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_feeds WHERE owner_uin=?1",
+                params![owner_uin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("统计待上传证据失败：{error}"))?;
+        let pull_cursor: Option<String> = connection
+            .query_row(
+                "SELECT cursor_position FROM remote_sync_pull_cursors WHERE account_uin=?1",
+                params![owner_uin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("读取同步游标失败：{error}"))
+            .ok()
+            .flatten();
+        let last_sync_at: Option<i64> = connection
+            .query_row(
+                "SELECT MAX(sent_at) FROM remote_sync_upload_state WHERE owner_uin=?1",
+                params![owner_uin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("读取最近同步时间失败：{error}"))?;
+        Ok(RemoteSyncState {
+            account_uin: Some(owner_uin),
+            registered: true,
+            last_sync_at,
+            uploaded_count: uploaded_count.max(0) as u64,
+            pending_count: pending_count.max(0) as u64,
+            pull_cursor,
+        })
+    })
+    .await
+    .map_err(|error| format!("读取远程同步状态失败：{error}"))?
 }

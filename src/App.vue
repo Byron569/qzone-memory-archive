@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -7,6 +7,7 @@ import Button from "primevue/button";
 import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import AppShell from "./layouts/AppShell.vue";
+import { runAutoSync } from "./composables/useAutoSync";
 import { useAuthStore } from "./stores/auth";
 
 const route = useRoute();
@@ -45,6 +46,18 @@ async function declineDisclaimer() {
     try { await getCurrentWindow().close(); } catch { /* no-op */ }
   }
 }
+
+// 启动后首次登录成功时静默执行一次账号级自动同步（失败不影响使用）。
+let autoSyncStarted = false;
+watch(
+  () => authStore.loggedIn,
+  (loggedIn) => {
+    if (loggedIn && !autoSyncStarted) {
+      autoSyncStarted = true;
+      void runAutoSync().catch((reason) => console.warn("启动自动同步失败", reason));
+    }
+  },
+);
 </script>
 
 <template>
