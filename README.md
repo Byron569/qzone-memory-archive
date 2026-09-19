@@ -5,8 +5,6 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 # QQ Zone Restore Archive
 
-> **本仓库说明**：这是 [xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)（基于已归档的 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二开版本）的个人 fork / 镜像，仅用于本地备份与学习。源代码与版权归原作者所有，遵循 GPL-3.0；本仓库不含任何发布签名密钥（release.jks 等），也未对原作者背书。
-
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2.0-blue)](https://v2.tauri.app/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-green)](https://vuejs.org/)
@@ -14,17 +12,8 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 将 QQ 空间动态、照片、视频与互动记录安全归档到本地的桌面 / 移动端工具。
 
-作者：[https://github.com/xiaosu19](https://github.com/xiaosu19)
-
-项目地址：[xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)
-
-> [!IMPORTANT]
-> 本项目是基于 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二次开发版本，并参考了 [LibraHp/GetQzonehistory](https://github.com/LibraHp/GetQzonehistory)、[ShunCai/QZoneExport](https://github.com/ShunCai/QZoneExport)、[salt-fishes/qzone-archiver](https://github.com/salt-fishes/qzone-archiver)、[11273/QzonePhoto](https://github.com/11273/QzonePhoto) 与 [Gu-Heping/onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 的历史取数、空间资料接口、评论正文和昵称解析思路。QZoneExport 参考实现遵循 Apache-2.0；详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。原项目作者、参考项目作者和腾讯公司均不对本分支提供背书或担保。
-
 > [!WARNING]
 > 本项目不是腾讯、QQ 或 QQ 空间官方产品。所谓“恢复已删除说说”仅指：当已删除内容仍残留在点赞、评论、回复等互动记录中时，尝试还原其中可取得的正文和媒体信息；没有互动痕迹、已被服务端彻底清除、无权访问或接口不再返回的内容无法恢复，也不保证归档结果完整。请仅处理本人账号或已获得充分授权的内容，并自行承担账号限制、第三方接口变化、数据遗漏和本地数据保管风险。
-
-如果本项目对你有帮助，可以支持并 Star [xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)。
 
 ## 功能
 
@@ -54,7 +43,7 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 ## 下载与安装
 
-请从本仓库的 [Releases](https://github.com/xiaosu19/QQ-Zone-Restore-Archive/releases) 下载与系统匹配的安装包：
+请从本仓库的 [Releases](https://github.com/Byron569/qzone-memory-archive/releases) 下载与系统匹配的安装包：
 
 - Windows：NSIS 安装程序（`.exe`）
 - macOS：Intel `x64` 或 Apple 芯片 `aarch64` 安装镜像（`.dmg`）
@@ -125,7 +114,7 @@ npm run tauri android build
 │   ├── components/         # 通用组件
 │   ├── stores/             # Pinia 状态管理
 │   ├── utils/              # 工具函数与类型
-│   └── layouts/            # 布局组件
+│   └── layouts/             # 布局组件
 ├── src-tauri/              # Rust 后端
 │   └── src/
 │       ├── main.rs         # 入口
@@ -166,10 +155,6 @@ npm run tauri android build
 ## 免责声明
 
 本软件是用于整理和备份个人 QQ 空间资料的本地工具，与腾讯公司、QQ、QQ 空间及其关联主体不存在隶属、授权、合作关系。使用者应在合法授权范围内使用，并自行承担使用风险。详见应用内《免责声明与使用须知》。
-
-## 友情链接
-
-* [LINUX DO](https://linux.do/) - 新的理想型社区
 
 ## 许可证
 
