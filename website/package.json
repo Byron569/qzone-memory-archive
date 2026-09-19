@@ -1,0 +1,21 @@
+{
+  "name": "qzonearchive-website",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev .",
+    "start": "vitepress dev .",
+    "build": "vitepress build .",
+    "preview": "vitepress preview ."
+  },
+  "devDependencies": {
+    "vitepress": "1.6.4"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "4.62.4"
+  },
+  "overrides": {
+    "vite": "6.4.3"
+  }
+}
