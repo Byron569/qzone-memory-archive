@@ -5,6 +5,7 @@
 //! are never returned to the Vue layer.  Evidence payloads are encrypted here
 //! with an X25519-derived XChaCha20-Poly1305 key before they reach the relay.
 
+use crate::qlogin::QLoginState;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -29,9 +30,11 @@ const DEVICE_TOKEN_ACCOUNT: &str = "device-token";
 const DEVICE_PRIVATE_KEY_ACCOUNT: &str = "device-private-key";
 const DEVICE_PUBLIC_KEY_ACCOUNT: &str = "device-public-key";
 const DEVICE_LABEL_ACCOUNT: &str = "device-label";
+const ACCOUNT_UIN_ACCOUNT: &str = "account-uin";
+const DEVICE_KEY_VERSION_ACCOUNT: &str = "device-key-version";
 
 const REQUEST_TIMEOUT_SECONDS: u64 = 20;
-const PROTOCOL_VERSION: i32 = 1;
+const PROTOCOL_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +43,8 @@ pub struct RemoteSyncConfig {
     pub device_id: Option<String>,
     pub server_device_id: Option<String>,
     pub label: Option<String>,
+    pub account_uin: Option<String>,
+    pub key_version: Option<i32>,
     pub registered: bool,
 }
 
@@ -49,6 +54,8 @@ pub struct RemoteDeviceRegistration {
     pub endpoint: String,
     pub device_id: String,
     pub server_device_id: String,
+    pub account_uin: String,
+    pub key_version: i32,
     pub created_at: String,
 }
 
@@ -58,6 +65,7 @@ struct RegisterDeviceRequest {
     device_id: String,
     public_key: String,
     label: Option<String>,
+    account_uin: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +74,8 @@ struct RegisterDeviceResponse {
     device_id: Uuid,
     device_token: String,
     created_at: String,
+    account_uin: Option<String>,
+    key_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +109,9 @@ pub struct RemoteEncryptedChange {
     pub operation: String,
     pub revision: i64,
     pub key_version: i32,
+    pub sender_key_version: i32,
+    pub target_uin: String,
+    pub source_uin: Option<String>,
     pub ciphertext_b64: String,
     pub nonce_b64: String,
     pub aad_b64: Option<String>,
@@ -145,12 +158,13 @@ pub struct RemotePullResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptRemotePayloadRequest {
-    pairing_id: String,
+    target_uin: String,
     peer_public_key: String,
+    target_key_version: i32,
+    sender_key_version: i32,
     record_id: String,
     operation: String,
     revision: i64,
-    key_version: i32,
     payload: serde_json::Value,
     deleted_at: Option<i64>,
 }
@@ -158,16 +172,17 @@ pub struct EncryptRemotePayloadRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptRemotePayloadRequest {
-    pairing_id: String,
-    peer_public_key: String,
+    source_uin: String,
     change: RemoteEncryptedChange,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptRemoteBatchRequest {
-    pairing_id: String,
+    target_uin: String,
     peer_public_key: String,
+    target_key_version: i32,
+    sender_key_version: i32,
     package: serde_json::Value,
     observations: Vec<serde_json::Value>,
 }
@@ -240,6 +255,9 @@ pub fn get_remote_sync_config() -> Result<RemoteSyncConfig, String> {
     let device_id = read_secret(DEVICE_ID_ACCOUNT)?;
     let server_device_id = read_secret(SERVER_DEVICE_ID_ACCOUNT)?;
     let label = read_secret(DEVICE_LABEL_ACCOUNT)?;
+    let account_uin = read_secret(ACCOUNT_UIN_ACCOUNT)?;
+    let key_version =
+        read_secret(DEVICE_KEY_VERSION_ACCOUNT)?.and_then(|value| value.parse::<i32>().ok());
     let registered = read_secret(DEVICE_TOKEN_ACCOUNT)?.is_some()
         && read_secret(DEVICE_PRIVATE_KEY_ACCOUNT)?.is_some()
         && read_secret(DEVICE_PUBLIC_KEY_ACCOUNT)?.is_some();
@@ -248,6 +266,8 @@ pub fn get_remote_sync_config() -> Result<RemoteSyncConfig, String> {
         device_id,
         server_device_id,
         label,
+        account_uin,
+        key_version,
         registered,
     })
 }
@@ -262,57 +282,74 @@ pub fn save_remote_sync_endpoint(endpoint: String) -> Result<RemoteSyncConfig, S
 #[tauri::command]
 pub async fn register_remote_device(
     endpoint: String,
-    registration_token: String,
+    account_uin: String,
     label: Option<String>,
 ) -> Result<RemoteDeviceRegistration, String> {
     let endpoint = normalize_endpoint(&endpoint)?;
-    let registration_token = registration_token.trim();
-    if registration_token.len() < 24 {
-        return Err("注册令牌至少需要 24 个字符".into());
+    let account_uin = account_uin.trim().to_owned();
+    if !valid_account_uin(&account_uin) {
+        return Err("QQ 号只能包含数字，且不能超过 32 位".into());
     }
     let label = label
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-
-    let device_id = match read_secret(DEVICE_ID_ACCOUNT)? {
-        Some(value) if !value.trim().is_empty() => value,
-        _ => Uuid::new_v4().to_string(),
-    };
     let (private_key, public_key) = load_or_create_keypair()?;
-    let client = http_client()?;
-    let response = client
-        .post(format!("{endpoint}/v1/devices"))
-        .header("X-Registration-Token", registration_token)
-        .json(&RegisterDeviceRequest {
-            device_id: device_id.clone(),
-            public_key: public_key.clone(),
-            label: label.clone(),
-        })
-        .send()
-        .await
-        .map_err(|error| format!("连接远程同步服务器失败：{error}"))?;
-    let response = checked_response(response).await?;
-    let registered: RegisterDeviceResponse = response
-        .json()
-        .await
-        .map_err(|error| format!("解析服务器注册响应失败：{error}"))?;
 
-    write_secret(ENDPOINT_ACCOUNT, &endpoint)?;
-    write_secret(DEVICE_ID_ACCOUNT, &device_id)?;
-    write_secret(SERVER_DEVICE_ID_ACCOUNT, &registered.device_id.to_string())?;
-    write_secret(DEVICE_TOKEN_ACCOUNT, &registered.device_token)?;
-    write_secret(DEVICE_PRIVATE_KEY_ACCOUNT, &private_key)?;
-    write_secret(DEVICE_PUBLIC_KEY_ACCOUNT, &public_key)?;
-    if let Some(label) = label.as_deref() {
-        write_secret(DEVICE_LABEL_ACCOUNT, label)?;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let device_id = match read_secret(DEVICE_ID_ACCOUNT)? {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => Uuid::new_v4().to_string(),
+        };
+        let client = http_client()?;
+        let response = client
+            .post(format!("{endpoint}/v1/devices"))
+            .json(&RegisterDeviceRequest {
+                device_id: device_id.clone(),
+                public_key: public_key.clone(),
+                label: label.clone(),
+                account_uin: account_uin.clone(),
+            })
+            .send()
+            .await
+            .map_err(|error| format!("连接远程同步服务器失败：{error}"))?;
+        if response.status() == StatusCode::CONFLICT {
+            if attempts >= 3 {
+                return Err("设备标识与其他账号冲突，请清除远程同步凭据后重试".into());
+            }
+            continue;
+        }
+        let response = checked_response(response).await?;
+        let registered: RegisterDeviceResponse = response
+            .json()
+            .await
+            .map_err(|error| format!("解析服务器注册响应失败：{error}"))?;
+
+        write_secret(ENDPOINT_ACCOUNT, &endpoint)?;
+        write_secret(DEVICE_ID_ACCOUNT, &device_id)?;
+        write_secret(SERVER_DEVICE_ID_ACCOUNT, &registered.device_id.to_string())?;
+        write_secret(DEVICE_TOKEN_ACCOUNT, &registered.device_token)?;
+        write_secret(DEVICE_PRIVATE_KEY_ACCOUNT, &private_key)?;
+        write_secret(DEVICE_PUBLIC_KEY_ACCOUNT, &public_key)?;
+        write_secret(ACCOUNT_UIN_ACCOUNT, &account_uin)?;
+        write_secret(
+            DEVICE_KEY_VERSION_ACCOUNT,
+            &registered.key_version.to_string(),
+        )?;
+        if let Some(label) = label.as_deref() {
+            write_secret(DEVICE_LABEL_ACCOUNT, label)?;
+        }
+
+        return Ok(RemoteDeviceRegistration {
+            endpoint,
+            device_id,
+            server_device_id: registered.device_id.to_string(),
+            account_uin,
+            key_version: registered.key_version,
+            created_at: registered.created_at,
+        });
     }
-
-    Ok(RemoteDeviceRegistration {
-        endpoint,
-        device_id,
-        server_device_id: registered.device_id.to_string(),
-        created_at: registered.created_at,
-    })
 }
 
 #[tauri::command]
@@ -395,17 +432,26 @@ pub fn encrypt_remote_payload(
     if request.operation != "upsert" && request.operation != "tombstone" {
         return Err("同步操作类型无效".into());
     }
-    if request.revision < 0 || !(1..=100).contains(&request.key_version) {
+    if request.revision < 0
+        || !(1..=100).contains(&request.target_key_version)
+        || !(1..=100).contains(&request.sender_key_version)
+    {
         return Err("记录版本或密钥版本无效".into());
     }
-    let key = derive_pairing_key(&request.pairing_id, &request.peer_public_key)?;
+    let source_uin = require_account_uin()?;
+    let key = derive_account_key(
+        &request.target_uin,
+        &request.peer_public_key,
+        request.target_key_version,
+    )?;
 
     let aad = format!(
-        "protocolVersion={PROTOCOL_VERSION};pairId={};recordId={};revision={};keyVersion={};operation={}",
-        request.pairing_id,
+        "protocolVersion={PROTOCOL_VERSION};sourceUin={source_uin};sourceKeyVersion={};targetUin={};targetKeyVersion={};recordId={};revision={};operation={}",
+        request.sender_key_version,
+        request.target_uin,
+        request.target_key_version,
         request.record_id,
         request.revision,
-        request.key_version,
         request.operation
     )
     .into_bytes();
@@ -429,7 +475,10 @@ pub fn encrypt_remote_payload(
         record_id: request.record_id,
         operation: request.operation,
         revision: request.revision,
-        key_version: request.key_version,
+        key_version: request.target_key_version,
+        sender_key_version: request.sender_key_version,
+        target_uin: request.target_uin,
+        source_uin: Some(source_uin),
         ciphertext_b64: BASE64.encode(ciphertext),
         nonce_b64: BASE64.encode(nonce),
         aad_b64: Some(BASE64.encode(aad)),
@@ -443,15 +492,31 @@ pub fn encrypt_remote_payload(
 }
 
 #[tauri::command]
-pub fn decrypt_remote_payload(
+pub async fn decrypt_remote_payload(
     request: DecryptRemotePayloadRequest,
 ) -> Result<serde_json::Value, String> {
     let change = request.change;
     if change.operation != "upsert" && change.operation != "tombstone" {
         return Err("同步操作类型无效".into());
     }
-    if change.revision < 0 || !(1..=100).contains(&change.key_version) {
+    if change.revision < 0
+        || !(1..=100).contains(&change.key_version)
+        || !(1..=100).contains(&change.sender_key_version)
+    {
         return Err("记录版本或密钥版本无效".into());
+    }
+    let local_uin = require_account_uin()?;
+    let local_key_version = current_key_version()?;
+    if change.key_version != local_key_version {
+        return Err("该记录加密目标不是本设备密钥版本".into());
+    }
+    let sender_uin = if request.source_uin.trim().is_empty() {
+        change.source_uin.as_deref().unwrap_or_default()
+    } else {
+        request.source_uin.as_str()
+    };
+    if sender_uin.is_empty() {
+        return Err("同步记录缺少发送方账号".into());
     }
     let aad = change
         .aad_b64
@@ -463,11 +528,13 @@ pub fn decrypt_remote_payload(
                 .map_err(|_| "同步记录的 AAD 不是有效 Base64".to_string())
         })?;
     let expected_aad = format!(
-        "protocolVersion={PROTOCOL_VERSION};pairId={};recordId={};revision={};keyVersion={};operation={}",
-        request.pairing_id,
+        "protocolVersion={PROTOCOL_VERSION};sourceUin={};sourceKeyVersion={};targetUin={};targetKeyVersion={};recordId={};revision={};operation={}",
+        sender_uin,
+        change.sender_key_version,
+        local_uin,
+        change.key_version,
         change.record_id,
         change.revision,
-        change.key_version,
         change.operation
     )
     .into_bytes();
@@ -487,7 +554,16 @@ pub fn decrypt_remote_payload(
     if digest != change.payload_digest {
         return Err("同步密文摘要校验失败".into());
     }
-    let key = derive_pairing_key(&request.pairing_id, &request.peer_public_key)?;
+    let sender_keys = get_account_public_keys(sender_uin.to_string()).await?;
+    let sender_key = sender_keys
+        .iter()
+        .find(|key| key.key_version == change.sender_key_version)
+        .ok_or_else(|| "找不到发送方对应密钥版本，可能已重装或换钥".to_string())?;
+    let key = derive_account_key(
+        &local_uin,
+        &sender_key.public_key,
+        change.sender_key_version,
+    )?;
     let cipher = XChaCha20Poly1305::new((&key).into());
     let plaintext = cipher
         .decrypt(
@@ -497,7 +573,7 @@ pub fn decrypt_remote_payload(
                 aad: &aad,
             },
         )
-        .map_err(|_| "同步记录解密失败，可能来自其他配对或已被篡改".to_string())?;
+        .map_err(|_| "同步记录解密失败，可能来自其他发送方或已被篡改".to_string())?;
     serde_json::from_slice(&plaintext).map_err(|_| "同步记录内容不是有效 JSON".to_string())
 }
 
@@ -532,12 +608,13 @@ pub fn encrypt_recovery_sync_batch(
             "observation": observation,
         });
         changes.push(encrypt_remote_payload(EncryptRemotePayloadRequest {
-            pairing_id: request.pairing_id.clone(),
+            target_uin: request.target_uin.clone(),
             peer_public_key: request.peer_public_key.clone(),
+            target_key_version: request.target_key_version,
+            sender_key_version: request.sender_key_version,
             record_id,
             operation: "upsert".into(),
             revision: 1,
-            key_version: 1,
             payload,
             deleted_at: None,
         })?);
@@ -545,7 +622,11 @@ pub fn encrypt_recovery_sync_batch(
     Ok(changes)
 }
 
-fn derive_pairing_key(pairing_id: &str, peer_public_key: &str) -> Result<[u8; 32], String> {
+fn derive_account_key(
+    target_uin: &str,
+    peer_public_key: &str,
+    peer_key_version: i32,
+) -> Result<[u8; 32], String> {
     let peer_bytes = BASE64
         .decode(peer_public_key.trim())
         .map_err(|_| "对端公钥不是有效 Base64".to_string())?;
@@ -564,25 +645,46 @@ fn derive_pairing_key(pairing_id: &str, peer_public_key: &str) -> Result<[u8; 32
     let private = StaticSecret::from(private_bytes);
     let shared = private.diffie_hellman(&PublicKey::from(peer_bytes));
     let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
-    let context = format!("qzonearchive/recovery-sync/v{PROTOCOL_VERSION}:{pairing_id}");
+    let context =
+        format!("qzonearchive/recovery-sync/v2:target={target_uin}:keyVersion={peer_key_version}");
     let mut key = [0_u8; 32];
     hkdf.expand(context.as_bytes(), &mut key)
         .map_err(|_| "派生同步密钥失败".to_string())?;
     Ok(key)
 }
 
+fn valid_account_uin(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.chars().all(|character| character.is_ascii_digit())
+}
+
+fn require_account_uin() -> Result<String, String> {
+    read_secret(ACCOUNT_UIN_ACCOUNT)?.ok_or_else(|| "当前设备尚未绑定 QQ 账号".to_string())
+}
+
+fn current_key_version() -> Result<i32, String> {
+    read_secret(DEVICE_KEY_VERSION_ACCOUNT)?
+        .ok_or_else(|| "当前设备缺少同步密钥版本".to_string())?
+        .parse::<i32>()
+        .map_err(|_| "本机同步密钥版本损坏".to_string())
+}
+
 #[tauri::command]
 pub async fn push_remote_changes(
-    pairing_id: String,
+    target_uin: String,
     changes: Vec<RemoteEncryptedChange>,
 ) -> Result<RemotePushResponse, String> {
     if changes.is_empty() || changes.len() > 100 {
         return Err("每次同步需要包含 1 到 100 条变更".into());
     }
+    if changes.iter().any(|change| change.target_uin != target_uin) {
+        return Err("一批变更必须发给同一目标账号".into());
+    }
     let endpoint = require_endpoint()?;
     let token = require_device_token()?;
     let response = authenticated_client(&token)?
-        .post(format!("{endpoint}/v1/pairings/{pairing_id}/changes"))
+        .post(format!("{endpoint}/v1/sync/changes"))
         .bearer_auth(&token)
         .json(&PushChangesRequest { changes: &changes })
         .send()
@@ -603,14 +705,13 @@ pub async fn push_remote_changes(
 
 #[tauri::command]
 pub async fn pull_remote_changes(
-    pairing_id: String,
     cursor: Option<String>,
     limit: Option<u16>,
 ) -> Result<RemotePullResponse, String> {
     let endpoint = require_endpoint()?;
     let token = require_device_token()?;
     let mut request = authenticated_client(&token)?
-        .get(format!("{endpoint}/v1/pairings/{pairing_id}/changes"))
+        .get(format!("{endpoint}/v1/sync/changes"))
         .bearer_auth(&token);
     let mut query = Vec::new();
     if let Some(cursor) = cursor.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -639,11 +740,11 @@ pub async fn pull_remote_changes(
 }
 
 #[tauri::command]
-pub async fn ack_remote_changes(pairing_id: String, cursor: String) -> Result<(), String> {
+pub async fn ack_remote_changes(cursor: String) -> Result<(), String> {
     let endpoint = require_endpoint()?;
     let token = require_device_token()?;
     let response = authenticated_client(&token)?
-        .post(format!("{endpoint}/v1/pairings/{pairing_id}/ack"))
+        .post(format!("{endpoint}/v1/sync/ack"))
         .bearer_auth(&token)
         .json(&AckChangesRequest { cursor: &cursor })
         .send()
@@ -663,6 +764,8 @@ pub fn clear_remote_sync_credentials() -> Result<(), String> {
         DEVICE_PRIVATE_KEY_ACCOUNT,
         DEVICE_PUBLIC_KEY_ACCOUNT,
         DEVICE_LABEL_ACCOUNT,
+        ACCOUNT_UIN_ACCOUNT,
+        DEVICE_KEY_VERSION_ACCOUNT,
     ] {
         delete_secret(account)?;
     }
@@ -851,4 +954,60 @@ async fn parse_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<
 #[allow(dead_code)]
 fn _status_is_retryable(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAccountPublicKey {
+    pub key_version: i32,
+    pub public_key: String,
+    pub device_id: String,
+    pub label: Option<String>,
+    pub registered_at: String,
+}
+
+/// 幂等确保当前登录账号已在远程服务器注册。登录后调用一次即可。
+#[tauri::command]
+pub async fn ensure_remote_device_registered(
+    login: tauri::State<'_, QLoginState>,
+) -> Result<RemoteSyncConfig, String> {
+    let endpoint = match read_secret(ENDPOINT_ACCOUNT)? {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return get_remote_sync_config(),
+    };
+    let uin = login
+        .qzone_auth()
+        .await
+        .map_err(|error| format!("读取当前登录账号失败：{error}"))?
+        .uin;
+    let registered_uin = read_secret(ACCOUNT_UIN_ACCOUNT)?;
+    if registered_uin.as_deref() != Some(uin.as_str()) {
+        let label = read_secret(DEVICE_LABEL_ACCOUNT)?;
+        register_remote_device(endpoint, uin, label).await?;
+    }
+    get_remote_sync_config()
+}
+
+/// 读取目标账号当前公钥列表，用于端到端加密路由。
+#[tauri::command]
+pub async fn get_account_public_keys(
+    account_uin: String,
+) -> Result<Vec<RemoteAccountPublicKey>, String> {
+    if !valid_account_uin(&account_uin) {
+        return Err("QQ 号无效".into());
+    }
+    let endpoint = require_endpoint()?;
+    let token = require_device_token()?;
+    let response = authenticated_client(&token)?
+        .get(format!("{endpoint}/v1/accounts/{account_uin}/public-keys"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|error| format!("读取账号公钥失败：{error}"))?;
+    let response = checked_response(response).await?;
+    let keys: Vec<RemoteAccountPublicKey> = response
+        .json()
+        .await
+        .map_err(|error| format!("解析账号公钥失败：{error}"))?;
+    Ok(keys)
 }

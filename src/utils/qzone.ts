@@ -200,3 +200,42 @@ export const listQzoneLibrary = (module: LibraryModule, parentKey?: string, quer
   invoke<LibraryPage>("list_qzone_library", { module, parentKey, query, year, limit, offset });
 export const listQzoneLibraryYears = (module: LibraryModule, parentKey?: string) =>
   invoke<number[]>("list_qzone_library_years", { module, parentKey });
+
+// ---- Account-level auto sync (remote evidence upload/pull state) ----
+
+export interface AutoSyncChunk {
+  package: RecoveryEvidenceSyncPackage;
+  hasMore: boolean;
+  nextEventKey?: string | null;
+}
+
+export interface RemoteSyncState {
+  accountUin?: string | null;
+  registered: boolean;
+  lastSyncAt?: number | null;
+  uploadedCount: number;
+  pendingCount: number;
+  pullCursor?: string | null;
+}
+
+export const listRemoteSyncTargets = () => invoke<string[]>("list_remote_sync_targets");
+export const prepareAutoSyncChunk = (
+  targetUin: string,
+  peerPubkey: string,
+  limit: number,
+  beforeEventKey?: string,
+) =>
+  invoke<AutoSyncChunk>("prepare_auto_sync_chunk", {
+    targetUin,
+    peerPubkey,
+    limit,
+    beforeEventKey: beforeEventKey || null,
+  });
+export const markRemoteEvidenceUploaded = (
+  targetUin: string,
+  packageId: string,
+  peerPubkey: string,
+  eventKeys: string[],
+) => invoke<number>("mark_remote_evidence_uploaded", { targetUin, packageId, peerPubkey, eventKeys });
+export const saveRemotePullCursor = (cursor: string) => invoke<void>("save_remote_pull_cursor", { cursor });
+export const getRemoteSyncState = () => invoke<RemoteSyncState>("get_remote_sync_state");

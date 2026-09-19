@@ -10,8 +10,9 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
-import { deleteAllAppData, exportRecoveryEvidence, importRecoveryEvidence, importRecoverySyncPackage, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, prepareRecoverySyncPackage, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary, type RecoveryEvidenceSyncPackage } from "../utils/qzone";
-import { ackRemoteChanges, claimRemotePairing, createRemotePairing, decryptRemotePayload, encryptRecoverySyncBatch, getRemoteSyncConfig, listRemotePairings, pullRemoteChanges, pushRemoteChanges, registerRemoteDevice, saveRemoteSyncEndpoint, type RemotePairing, type RemotePairingInvitation, type RemoteSyncConfig } from "../utils/remoteSync";
+import { deleteAllAppData, exportRecoveryEvidence, getRemoteSyncState, importRecoveryEvidence, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary, type RemoteSyncState } from "../utils/qzone";
+import { runAutoSync } from "../composables/useAutoSync";
+import { getRemoteSyncConfig, registerRemoteDevice, saveRemoteSyncEndpoint, type RemoteSyncConfig } from "../utils/remoteSync";
 
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
@@ -33,13 +34,10 @@ const candidateConfirmVisible = ref(false);
 const selectedCandidate = ref<RecoveryEvidenceCandidate | null>(null);
 const remoteConfig = ref<RemoteSyncConfig | null>(null);
 const remoteEndpoint = ref("");
-const remoteRegistrationToken = ref("");
 const remoteDeviceLabel = ref("");
-const remoteClaimCode = ref("");
-const remoteInvitation = ref<RemotePairingInvitation | null>(null);
-const remotePairings = ref<RemotePairing[]>([]);
-const remoteBusy = ref<"save" | "register" | "create" | "claim" | "refresh" | "push" | "pull" | null>(null);
+const remoteBusy = ref<"save" | "register" | "refresh" | "sync" | null>(null);
 const remoteNotice = ref("");
+const remoteSyncState = ref<RemoteSyncState | null>(null);
 
 const evidenceFilter = [{ name: "QQ 空间双端证据包", extensions: ["qzone-evidence", "json"] }];
 
@@ -86,9 +84,9 @@ async function refreshRemoteSync() {
     remoteEndpoint.value = remoteConfig.value.endpoint || remoteEndpoint.value;
     remoteDeviceLabel.value = remoteConfig.value.label || remoteDeviceLabel.value;
     if (remoteConfig.value.registered) {
-      remotePairings.value = await listRemotePairings();
+      remoteSyncState.value = await getRemoteSyncState();
     } else {
-      remotePairings.value = [];
+      remoteSyncState.value = null;
     }
   } catch (reason) {
     // The settings page should remain usable if the system credential store
@@ -209,14 +207,17 @@ async function saveRemoteEndpoint() {
 
 async function registerRemote() {
   if (remoteBusy.value) return;
+  if (!loggedIn.value || !user.value?.uin) {
+    error.value = "请先登录 QQ 空间，登录的 QQ 号会自动作为同步账号";
+    return;
+  }
   remoteBusy.value = "register";
   remoteNotice.value = "";
   try {
-    const result = await registerRemoteDevice(remoteEndpoint.value, remoteRegistrationToken.value, remoteDeviceLabel.value);
-    remoteRegistrationToken.value = "";
+    const result = await registerRemoteDevice(remoteEndpoint.value, user.value.uin, remoteDeviceLabel.value);
     remoteConfig.value = await getRemoteSyncConfig();
-    remotePairings.value = await listRemotePairings();
-    remoteNotice.value = `设备注册成功（设备 ${result.deviceId.slice(0, 8)}…）。注册令牌不会保存在应用数据库或前端存储中。`;
+    remoteSyncState.value = await getRemoteSyncState();
+    remoteNotice.value = `设备注册成功（账号 ${result.accountUin}，密钥版本 ${result.keyVersion}）。`;
   } catch (reason) {
     error.value = `注册远程设备失败：${String(reason)}`;
   } finally {
@@ -224,159 +225,25 @@ async function registerRemote() {
   }
 }
 
-async function createPairing() {
+async function runSyncAll() {
   if (remoteBusy.value) return;
-  remoteBusy.value = "create";
-  remoteNotice.value = "";
-  try {
-    remoteInvitation.value = await createRemotePairing();
-    remoteNotice.value = "配对邀请已创建。请把 10 位配对码交给另一台经过授权的设备。";
-    remotePairings.value = await listRemotePairings();
-  } catch (reason) {
-    error.value = `创建配对邀请失败：${String(reason)}`;
-  } finally {
-    remoteBusy.value = null;
-  }
-}
-
-async function claimPairing() {
-  if (remoteBusy.value) return;
-  remoteBusy.value = "claim";
-  remoteNotice.value = "";
-  try {
-    await claimRemotePairing(remoteClaimCode.value);
-    remoteClaimCode.value = "";
-    remotePairings.value = await listRemotePairings();
-    remoteNotice.value = "配对成功。双方公钥已交换，下一步即可建立客户端加密同步。";
-  } catch (reason) {
-    error.value = `接受配对邀请失败：${String(reason)}`;
-  } finally {
-    remoteBusy.value = null;
-  }
-}
-
-function acceptedRemotePairing() {
-  return remotePairings.value.find((pairing) => pairing.status === "accepted") || null;
-}
-
-function peerPublicKey(pairing: RemotePairing) {
-  const localServerDeviceId = remoteConfig.value?.serverDeviceId;
-  if (!localServerDeviceId) return null;
-  if (pairing.initiatorDeviceId === localServerDeviceId) return pairing.claimantPublicKey || null;
-  if (pairing.claimantDeviceId === localServerDeviceId) return pairing.initiatorPublicKey || null;
-  return null;
-}
-
-function remoteCursorKey(pairingId: string) {
-  return `qzone-remote-sync-cursor:${pairingId}`;
-}
-
-function syncPackageMetadata(pkg: RecoveryEvidenceSyncPackage) {
-  return {
-    schemaVersion: pkg.schemaVersion,
-    packageId: pkg.packageId,
-    exporterUin: pkg.exporterUin,
-    targetUin: pkg.targetUin ?? null,
-    createdAt: pkg.createdAt,
-  };
-}
-
-async function pushRemoteEvidence() {
-  if (remoteBusy.value) return;
-  const pairing = acceptedRemotePairing();
-  const key = pairing ? peerPublicKey(pairing) : null;
-  const targetUin = evidenceTargetUin.value.trim();
-  if (!pairing || !key) {
-    error.value = "请先完成至少一组远程配对";
+  if (!loggedIn.value || !user.value?.uin) {
+    error.value = "请先登录 QQ 空间";
     return;
   }
-  if (!/^\d+$/.test(targetUin)) {
-    error.value = "请先填写经过授权的对方 QQ 号，作为同步目标";
-    return;
-  }
-  remoteBusy.value = "push";
+  remoteBusy.value = "sync";
   remoteNotice.value = "";
+  error.value = "";
   try {
-    const pkg = await prepareRecoverySyncPackage(targetUin);
-    const metadata = syncPackageMetadata(pkg);
-    let uploaded = 0;
-    for (let offset = 0; offset < pkg.observations.length; offset += 100) {
-      const changes = await encryptRecoverySyncBatch({
-        pairingId: pairing.pairingId,
-        peerPublicKey: key,
-        package: metadata,
-        observations: pkg.observations.slice(offset, offset + 100),
-      });
-      const result = await pushRemoteChanges(pairing.pairingId, changes);
-      uploaded += result.accepted;
-    }
-    remoteNotice.value = pkg.observations.length
-      ? `已将 ${uploaded} 条本地证据加密上传。对方刷新后可拉取并审核。`
-      : "当前没有与目标账号相关的本地证据可上传。";
-  } catch (reason) {
-    error.value = `上传远程证据失败：${String(reason)}`;
-  } finally {
-    remoteBusy.value = null;
-  }
-}
-
-async function pullRemoteEvidence() {
-  if (remoteBusy.value) return;
-  const pairing = acceptedRemotePairing();
-  const key = pairing ? peerPublicKey(pairing) : null;
-  if (!pairing || !key) {
-    error.value = "请先完成至少一组远程配对";
-    return;
-  }
-  remoteBusy.value = "pull";
-  remoteNotice.value = "";
-  try {
-    let cursor = localStorage.getItem(remoteCursorKey(pairing.pairingId)) || undefined;
-    let pulled = 0;
-    let imported = 0;
-    do {
-      const page = await pullRemoteChanges(pairing.pairingId, cursor, 100);
-      const packages = new Map<string, RecoveryEvidenceSyncPackage>();
-      for (const change of page.changes) {
-        const decoded = await decryptRemotePayload(pairing.pairingId, key, change) as Partial<RecoveryEvidenceSyncPackage> & { observation?: RecoveryEvidenceSyncPackage["observations"][number] };
-        if (!decoded.packageId || !decoded.exporterUin || !decoded.observation) continue;
-        const current = packages.get(decoded.packageId);
-        if (current) current.observations.push(decoded.observation);
-        else packages.set(decoded.packageId, {
-          schemaVersion: decoded.schemaVersion || 1,
-          packageId: decoded.packageId,
-          exporterUin: decoded.exporterUin,
-          targetUin: decoded.targetUin,
-          createdAt: decoded.createdAt || Math.floor(Date.now() / 1000),
-          observations: [decoded.observation],
-        });
-        pulled += 1;
-      }
-      for (const pkg of packages.values()) {
-        const result = await importRecoverySyncPackage(pkg);
-        imported += result.itemCount;
-        await refreshEvidencePackages();
-      }
-      cursor = page.nextCursor.position;
-      if (!page.hasMore) {
-        await ackRemoteChanges(pairing.pairingId, cursor);
-        localStorage.setItem(remoteCursorKey(pairing.pairingId), cursor);
-      }
-      if (!page.hasMore) break;
-    } while (true);
+    const summary = await runAutoSync();
     await refreshEvidenceCandidates();
-    remoteNotice.value = pulled
-      ? `已解密拉取 ${pulled} 条远程证据，导入 ${imported} 条候选记录，请逐条确认。`
-      : "没有发现新的远程证据。";
+    remoteSyncState.value = await getRemoteSyncState();
+    remoteNotice.value = `同步完成：上传 ${summary.uploaded} 条${summary.skippedTargets ? `，跳过 ${summary.skippedTargets} 个未注册的对方账号` : ""}；拉取处理 ${summary.pulled} 条。`;
   } catch (reason) {
-    error.value = `拉取远程证据失败：${String(reason)}`;
+    error.value = `同步失败：${String(reason)}`;
   } finally {
     remoteBusy.value = null;
   }
-}
-
-function formatRemotePairingStatus(status: string) {
-  return ({ pending: "等待另一台设备", accepted: "已配对", revoked: "已撤销", expired: "已过期" } as Record<string, string>)[status] || status;
 }
 
 function candidateLabel(candidate: RecoveryEvidenceCandidate) {
@@ -434,40 +301,23 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
     </article>
 
     <article class="surface-card settings-card remote-sync-setting">
-      <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-cloud-upload" /></span><div><h3>远程双端同步</h3><p>通过你自己的服务器交换两台设备的加密证据。服务器只保存密文、摘要和游标，不保存 QQ Cookie。</p></div></div>
+      <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-cloud-upload" /></span><div><h3>账号级自动同步</h3><p>程序登录 QQ 空间后自动用当前 QQ 号注册设备，把本账号的互动记录加密同步到相关账号。服务器只保存密文、摘要和游标，不保存 QQ Cookie 或明文内容。</p></div></div>
       <div class="remote-sync-form">
-        <InputText v-model.trim="remoteEndpoint" placeholder="服务器地址，例如 http://127.0.0.1:8787" aria-label="远程同步服务器地址" />
+        <InputText v-model.trim="remoteEndpoint" placeholder="服务器地址，例如 http://193.112.172.120:8787" aria-label="远程同步服务器地址" />
         <InputText v-model.trim="remoteDeviceLabel" placeholder="设备名称（可选）" aria-label="设备名称" />
         <div class="remote-sync-actions">
           <Button label="保存地址" icon="pi pi-save" severity="secondary" outlined :loading="remoteBusy === 'save'" :disabled="Boolean(remoteBusy) || !remoteEndpoint" @click="saveRemoteEndpoint" />
-          <InputText v-model="remoteRegistrationToken" type="password" placeholder="首次注册令牌" aria-label="首次注册令牌" autocomplete="off" />
-          <Button label="注册本设备" icon="pi pi-key" :loading="remoteBusy === 'register'" :disabled="Boolean(remoteBusy) || !remoteEndpoint || remoteRegistrationToken.length < 24" @click="registerRemote" />
-        </div>
-        <small v-if="remoteConfig?.registered" class="remote-sync-state"><i class="pi pi-check-circle" /> 本设备已注册，可创建或接受配对。</small>
-        <small v-else class="remote-sync-state"><i class="pi pi-info-circle" /> 先保存服务器地址，再输入管理员提供的注册令牌完成一次注册。</small>
-      </div>
-      <div v-if="remoteConfig?.registered" class="remote-pairing-panel">
-        <div class="remote-sync-actions">
-          <Button label="创建配对码" icon="pi pi-plus" :loading="remoteBusy === 'create'" :disabled="Boolean(remoteBusy)" @click="createPairing" />
-          <InputText v-model.trim="remoteClaimCode" class="remote-code-input" placeholder="输入对方的 10 位配对码" aria-label="配对码" maxlength="10" />
-          <Button label="接受配对" icon="pi pi-link" severity="secondary" outlined :loading="remoteBusy === 'claim'" :disabled="Boolean(remoteBusy) || remoteClaimCode.length !== 10" @click="claimPairing" />
+          <Button label="注册本设备" icon="pi pi-key" :loading="remoteBusy === 'register'" :disabled="Boolean(remoteBusy) || !remoteEndpoint || !loggedIn" @click="registerRemote" />
+          <Button label="立即同步" icon="pi pi-sync" :loading="remoteBusy === 'sync'" :disabled="Boolean(remoteBusy) || !loggedIn" @click="runSyncAll" />
           <Button label="刷新" icon="pi pi-refresh" severity="secondary" text :loading="remoteBusy === 'refresh'" :disabled="Boolean(remoteBusy)" @click="refreshRemoteSync" />
         </div>
-        <div class="remote-sync-actions">
-          <Button label="加密上传证据" icon="pi pi-cloud-upload" :loading="remoteBusy === 'push'" :disabled="Boolean(remoteBusy) || !evidenceTargetUin" @click="pushRemoteEvidence" />
-          <Button label="拉取并加入候选" icon="pi pi-cloud-download" severity="secondary" outlined :loading="remoteBusy === 'pull'" :disabled="Boolean(remoteBusy)" @click="pullRemoteEvidence" />
-          <small class="remote-sync-hint">上传/拉取使用上方填写的对方 QQ 号作为授权范围。</small>
-        </div>
-        <div v-if="remoteInvitation" class="remote-invitation">
-          <strong>本次配对码：{{ remoteInvitation.code }}</strong>
-          <small>有效期至 {{ formatEvidenceTime(Date.parse(remoteInvitation.expiresAt) / 1000) }}</small>
-        </div>
-        <div v-if="remotePairings.length" class="remote-pairing-list">
-          <div v-for="pairing in remotePairings" :key="pairing.pairingId" class="remote-pairing-row">
-            <span><i class="pi pi-link" /> {{ pairing.pairingId.slice(0, 8) }}…</span>
-            <small>{{ formatRemotePairingStatus(pairing.status) }}</small>
-          </div>
-        </div>
+        <small v-if="remoteConfig?.registered" class="remote-sync-state"><i class="pi pi-check-circle" /> 已注册：账号 {{ remoteConfig.accountUin }}，密钥版本 {{ remoteConfig.keyVersion }}。对方账号注册后即可互相同步。</small>
+        <small v-else class="remote-sync-state"><i class="pi pi-info-circle" /> 保存服务器地址后点击「注册本设备」，登录的 QQ 号会自动成为同步账号。</small>
+      </div>
+      <div v-if="remoteSyncState" class="remote-sync-stats">
+        <span><i class="pi pi-upload" /> 已上传 {{ remoteSyncState.uploadedCount }} 条</span>
+        <span><i class="pi pi-clock" /> 待上传 {{ remoteSyncState.pendingCount }} 条</span>
+        <span><i class="pi pi-history" /> 上次同步：{{ remoteSyncState.lastSyncAt ? formatEvidenceTime(remoteSyncState.lastSyncAt) : "从未" }}</span>
       </div>
     </article>
     <p v-if="remoteNotice" class="evidence-notice"><i class="pi pi-check-circle" />{{ remoteNotice }}</p>
@@ -531,6 +381,9 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
 .remote-sync-state { color: var(--muted); font-size: 11px; }
 .remote-sync-state .pi { margin-right: 4px; color: #169766; }
 .remote-sync-hint { flex: 1 1 100%; color: var(--muted); font-size: 11px; }
+.remote-sync-stats { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; margin-left: 55px; }
+.remote-sync-stats span { display: inline-flex; align-items: center; gap: 5px; color: var(--text-color-secondary, #64748b); font-size: 12px; }
+.remote-sync-stats .pi { color: #169766; }
 .remote-pairing-panel { display: grid; gap: 10px; margin-top: 13px; margin-left: 55px; }
 .remote-code-input { max-width: 220px; letter-spacing: .08em; text-transform: uppercase; }
 .remote-invitation { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 11px 13px; color: var(--heading); background: var(--app-bg); border-radius: 10px; }

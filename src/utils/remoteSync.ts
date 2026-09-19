@@ -5,6 +5,8 @@ export interface RemoteSyncConfig {
   deviceId?: string | null;
   serverDeviceId?: string | null;
   label?: string | null;
+  accountUin?: string | null;
+  keyVersion?: number | null;
   registered: boolean;
 }
 
@@ -12,7 +14,17 @@ export interface RemoteDeviceRegistration {
   endpoint: string;
   deviceId: string;
   serverDeviceId: string;
+  accountUin: string;
+  keyVersion: number;
   createdAt: string;
+}
+
+export interface RemoteAccountPublicKey {
+  keyVersion: number;
+  publicKey: string;
+  deviceId: string;
+  label?: string | null;
+  registeredAt: string;
 }
 
 export interface RemotePairingInvitation {
@@ -40,6 +52,9 @@ export interface RemoteEncryptedChange {
   operation: "upsert" | "tombstone";
   revision: number;
   keyVersion: number;
+  senderKeyVersion: number;
+  targetUin: string;
+  sourceUin?: string | null;
   ciphertextB64: string;
   nonceB64: string;
   aadB64?: string | null;
@@ -78,41 +93,47 @@ export interface RemotePullResponse {
 export const getRemoteSyncConfig = () => invoke<RemoteSyncConfig>("get_remote_sync_config");
 export const saveRemoteSyncEndpoint = (endpoint: string) =>
   invoke<RemoteSyncConfig>("save_remote_sync_endpoint", { endpoint });
-export const registerRemoteDevice = (endpoint: string, registrationToken: string, label?: string) =>
+export const registerRemoteDevice = (endpoint: string, accountUin: string, label?: string) =>
   invoke<RemoteDeviceRegistration>("register_remote_device", {
     endpoint,
-    registrationToken,
+    accountUin,
     label: label?.trim() || null,
   });
+export const ensureRemoteDeviceRegistered = () =>
+  invoke<RemoteSyncConfig>("ensure_remote_device_registered");
+export const getAccountPublicKeys = (accountUin: string) =>
+  invoke<RemoteAccountPublicKey[]>("get_account_public_keys", { accountUin });
+
+// Legacy pairing commands are kept exported for older flows; the new UI no longer uses them.
 export const createRemotePairing = () => invoke<RemotePairingInvitation>("create_remote_pairing");
 export const claimRemotePairing = (code: string) => invoke<RemotePairing>("claim_remote_pairing", { code });
 export const listRemotePairings = () => invoke<RemotePairing[]>("list_remote_pairings");
+
 export const encryptRemotePayload = (request: {
-  pairingId: string;
+  targetUin: string;
   peerPublicKey: string;
+  targetKeyVersion: number;
+  senderKeyVersion: number;
   recordId: string;
   operation: "upsert" | "tombstone";
   revision: number;
-  keyVersion?: number;
   payload: unknown;
   deletedAt?: number;
-}) => invoke<RemoteEncryptedChange>("encrypt_remote_payload", {
-  request: { ...request, keyVersion: request.keyVersion ?? 1 },
-});
-export const decryptRemotePayload = (pairingId: string, peerPublicKey: string, change: RemoteEncryptedChange) =>
-  invoke<unknown>("decrypt_remote_payload", {
-    request: { pairingId, peerPublicKey, change },
-  });
+}) => invoke<RemoteEncryptedChange>("encrypt_remote_payload", { request });
+export const decryptRemotePayload = (request: { sourceUin: string; change: RemoteEncryptedChange }) =>
+  invoke<unknown>("decrypt_remote_payload", { request });
 export const encryptRecoverySyncBatch = (request: {
-  pairingId: string;
+  targetUin: string;
   peerPublicKey: string;
+  targetKeyVersion: number;
+  senderKeyVersion: number;
   package: unknown;
   observations: unknown[];
 }) => invoke<RemoteEncryptedChange[]>("encrypt_recovery_sync_batch", { request });
-export const pushRemoteChanges = (pairingId: string, changes: RemoteEncryptedChange[]) =>
-  invoke<RemotePushResponse>("push_remote_changes", { pairingId, changes });
-export const pullRemoteChanges = (pairingId: string, cursor?: string, limit = 100) =>
-  invoke<RemotePullResponse>("pull_remote_changes", { pairingId, cursor: cursor || null, limit });
-export const ackRemoteChanges = (pairingId: string, cursor: string) =>
-  invoke<void>("ack_remote_changes", { pairingId, cursor });
+export const pushRemoteChanges = (targetUin: string, changes: RemoteEncryptedChange[]) =>
+  invoke<RemotePushResponse>("push_remote_changes", { targetUin, changes });
+export const pullRemoteChanges = (cursor?: string, limit = 100) =>
+  invoke<RemotePullResponse>("pull_remote_changes", { cursor: cursor || null, limit });
+export const ackRemoteChanges = (cursor: string) =>
+  invoke<void>("ack_remote_changes", { cursor });
 export const clearRemoteSyncCredentials = () => invoke<void>("clear_remote_sync_credentials");
