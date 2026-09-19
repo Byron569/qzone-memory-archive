@@ -697,11 +697,14 @@ fn build_recovery_evidence_package(
                  WHERE owner_uin=?1 AND author_uin=?2 AND cell_id IS NOT NULL",
             )
             .map_err(|error| format!("准备双端目标动态筛选失败：{error}"))?;
-        statement
-            .query_map(params![exporter_uin, target_uin], |row| row.get::<_, String>(0))
+        let target_cell_ids = statement
+            .query_map(params![exporter_uin, target_uin], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|error| format!("查询双端目标动态筛选失败：{error}"))?
             .filter_map(Result::ok)
-            .collect::<HashSet<_>>()
+            .collect::<HashSet<_>>();
+        target_cell_ids
     } else {
         HashSet::new()
     };
@@ -795,8 +798,7 @@ fn build_recovery_evidence_package(
         })
         .map_err(|error| format!("查询双端原动态导出失败：{error}"))?;
     for row in dynamic_rows {
-        let mut observation =
-            row.map_err(|error| format!("读取双端原动态导出失败：{error}"))?;
+        let mut observation = row.map_err(|error| format!("读取双端原动态导出失败：{error}"))?;
         if let Some(target_uin) = target_uin {
             if observation.original_author_uin.as_deref() != Some(target_uin) {
                 continue;
@@ -4440,13 +4442,13 @@ pub fn import_recovery_evidence(
     }
     let payload =
         fs::read_to_string(path).map_err(|error| format!("读取双端证据包失败：{error}"))?;
-    let value: Value =
-        serde_json::from_str(&payload).map_err(|error| format!("双端证据包不是有效 JSON：{error}"))?;
+    let value: Value = serde_json::from_str(&payload)
+        .map_err(|error| format!("双端证据包不是有效 JSON：{error}"))?;
     if contains_sensitive_recovery_key(&value) {
         return Err("双端证据包疑似包含登录凭证，已拒绝导入".into());
     }
-    let package: RecoveryEvidencePackage = serde_json::from_value(value)
-        .map_err(|error| format!("双端证据包格式不兼容：{error}"))?;
+    let package: RecoveryEvidencePackage =
+        serde_json::from_value(value).map_err(|error| format!("双端证据包格式不兼容：{error}"))?;
     validate_recovery_evidence_package(&package)?;
     let mut connection = open_database(&app)?;
     let transaction = connection
