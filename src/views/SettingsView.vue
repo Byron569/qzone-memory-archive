@@ -12,7 +12,7 @@ import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
 import { deleteAllAppData, exportRecoveryEvidence, getRemoteSyncState, importRecoveryEvidence, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary, type RemoteSyncState } from "../utils/qzone";
 import { runAutoSync } from "../composables/useAutoSync";
-import { getRemoteSyncConfig, registerRemoteDevice, saveRemoteSyncEndpoint, type RemoteSyncConfig } from "../utils/remoteSync";
+import { getRemoteSyncConfig, type RemoteSyncConfig } from "../utils/remoteSync";
 
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
@@ -33,9 +33,7 @@ const candidateBusy = ref<number | null>(null);
 const candidateConfirmVisible = ref(false);
 const selectedCandidate = ref<RecoveryEvidenceCandidate | null>(null);
 const remoteConfig = ref<RemoteSyncConfig | null>(null);
-const remoteEndpoint = ref("");
-const remoteDeviceLabel = ref("");
-const remoteBusy = ref<"save" | "register" | "refresh" | "sync" | null>(null);
+const remoteBusy = ref<"refresh" | "sync" | null>(null);
 const remoteNotice = ref("");
 const remoteSyncState = ref<RemoteSyncState | null>(null);
 
@@ -81,8 +79,6 @@ async function refreshRemoteSync() {
   remoteBusy.value = "refresh";
   try {
     remoteConfig.value = await getRemoteSyncConfig();
-    remoteEndpoint.value = remoteConfig.value.endpoint || remoteEndpoint.value;
-    remoteDeviceLabel.value = remoteConfig.value.label || remoteDeviceLabel.value;
     if (remoteConfig.value.registered) {
       remoteSyncState.value = await getRemoteSyncState();
     } else {
@@ -190,41 +186,6 @@ async function confirmCandidateMerge() {
   }
 }
 
-async function saveRemoteEndpoint() {
-  if (remoteBusy.value) return;
-  remoteBusy.value = "save";
-  remoteNotice.value = "";
-  try {
-    remoteConfig.value = await saveRemoteSyncEndpoint(remoteEndpoint.value);
-    remoteEndpoint.value = remoteConfig.value.endpoint || remoteEndpoint.value;
-    remoteNotice.value = "服务器地址已保存到系统安全凭据库。";
-  } catch (reason) {
-    error.value = `保存远程服务器地址失败：${String(reason)}`;
-  } finally {
-    remoteBusy.value = null;
-  }
-}
-
-async function registerRemote() {
-  if (remoteBusy.value) return;
-  if (!loggedIn.value || !user.value?.uin) {
-    error.value = "请先登录 QQ 空间，登录的 QQ 号会自动作为同步账号";
-    return;
-  }
-  remoteBusy.value = "register";
-  remoteNotice.value = "";
-  try {
-    const result = await registerRemoteDevice(remoteEndpoint.value, user.value.uin, remoteDeviceLabel.value);
-    remoteConfig.value = await getRemoteSyncConfig();
-    remoteSyncState.value = await getRemoteSyncState();
-    remoteNotice.value = `设备注册成功（账号 ${result.accountUin}，密钥版本 ${result.keyVersion}）。`;
-  } catch (reason) {
-    error.value = `注册远程设备失败：${String(reason)}`;
-  } finally {
-    remoteBusy.value = null;
-  }
-}
-
 async function runSyncAll() {
   if (remoteBusy.value) return;
   if (!loggedIn.value || !user.value?.uin) {
@@ -301,17 +262,13 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
     </article>
 
     <article class="surface-card settings-card remote-sync-setting">
-      <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-cloud-upload" /></span><div><h3>账号级自动同步</h3><p>程序登录 QQ 空间后自动用当前 QQ 号注册设备，把本账号的互动记录加密同步到相关账号。服务器只保存密文、摘要和游标，不保存 QQ Cookie 或明文内容。</p></div></div>
+      <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-cloud-upload" /></span><div><h3>账号级自动同步</h3><p>登录后自动使用内置的官方同步服务器完成设备注册与增量同步，服务器只保存密文、摘要和游标，不保存 QQ Cookie 或明文内容。全程自动，无需任何配置。</p></div></div>
       <div class="remote-sync-form">
-        <InputText v-model.trim="remoteEndpoint" placeholder="服务器地址，例如 http://193.112.172.120:8787" aria-label="远程同步服务器地址" />
-        <InputText v-model.trim="remoteDeviceLabel" placeholder="设备名称（可选）" aria-label="设备名称" />
         <div class="remote-sync-actions">
-          <Button label="保存地址" icon="pi pi-save" severity="secondary" outlined :loading="remoteBusy === 'save'" :disabled="Boolean(remoteBusy) || !remoteEndpoint" @click="saveRemoteEndpoint" />
-          <Button label="注册本设备" icon="pi pi-key" :loading="remoteBusy === 'register'" :disabled="Boolean(remoteBusy) || !remoteEndpoint || !loggedIn" @click="registerRemote" />
           <Button label="立即同步" icon="pi pi-sync" :loading="remoteBusy === 'sync'" :disabled="Boolean(remoteBusy) || !loggedIn" @click="runSyncAll" />
           <Button label="刷新" icon="pi pi-refresh" severity="secondary" text :loading="remoteBusy === 'refresh'" :disabled="Boolean(remoteBusy)" @click="refreshRemoteSync" />
         </div>
-        <small v-if="remoteConfig?.registered" class="remote-sync-state"><i class="pi pi-check-circle" /> 已注册：账号 {{ remoteConfig.accountUin }}，密钥版本 {{ remoteConfig.keyVersion }}。对方账号注册后即可互相同步。</small>
+        <small v-if="remoteConfig?.registered" class="remote-sync-state"><i class="pi pi-check-circle" /> 已注册：账号 {{ remoteConfig.accountUin }}，密钥版本 {{ remoteConfig.keyVersion }}。</small>
         <small v-else class="remote-sync-state"><i class="pi pi-info-circle" /> 保存服务器地址后点击「注册本设备」，登录的 QQ 号会自动成为同步账号。</small>
       </div>
       <div v-if="remoteSyncState" class="remote-sync-stats">

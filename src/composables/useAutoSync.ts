@@ -1,4 +1,5 @@
 import { ackRemoteChanges, decryptRemotePayload, encryptRecoverySyncBatch, ensureRemoteDeviceRegistered, getAccountPublicKeys, getRemoteSyncConfig, pullRemoteChanges, pushRemoteChanges, type RemoteAccountPublicKey } from "../utils/remoteSync";
+import { SYNC_SERVER_ENDPOINT, saveRemoteSyncEndpoint } from "../utils/remoteSync";
 import { getRemoteSyncState, importRecoverySyncPackage, listRemoteSyncTargets, markRemoteEvidenceUploaded, prepareAutoSyncChunk, saveRemotePullCursor, type RecoveryEvidenceSyncPackage } from "../utils/qzone";
 
 export interface AutoSyncSummary {
@@ -28,7 +29,9 @@ function syncPackageMetadata(pkg: RecoveryEvidenceSyncPackage) {
  */
 export async function runAutoSync(): Promise<AutoSyncSummary> {
   const config = await getRemoteSyncConfig();
-  if (!config?.endpoint) throw new Error("尚未配置远程同步服务器地址");
+  if (config?.endpoint?.trim() !== SYNC_SERVER_ENDPOINT) {
+    await saveRemoteSyncEndpoint(SYNC_SERVER_ENDPOINT).catch(() => undefined);
+  }
 
   const registered = await ensureRemoteDeviceRegistered();
   const senderKeyVersion = registered.keyVersion ?? 1;
