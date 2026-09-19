@@ -1,10 +1,11 @@
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,6 +116,120 @@ struct PairingListResponse {
     pairings: Vec<PairingResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PushChangesRequest {
+    changes: Vec<EncryptedChangeInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptedChangeInput {
+    record_id: String,
+    operation: String,
+    revision: i64,
+    key_version: i32,
+    ciphertext_b64: String,
+    nonce_b64: String,
+    aad_b64: Option<String>,
+    payload_digest: String,
+    deleted_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncCursorResponse {
+    #[serde(rename = "streamId")]
+    stream_id: Uuid,
+    position: String,
+    #[serde(rename = "issuedAt")]
+    issued_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncConflictResponse {
+    #[serde(rename = "recordId")]
+    record_id: String,
+    #[serde(rename = "localRevision")]
+    local_revision: i64,
+    #[serde(rename = "remoteRevision")]
+    remote_revision: i64,
+    #[serde(rename = "localDigest")]
+    local_digest: String,
+    #[serde(rename = "remoteDigest")]
+    remote_digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PushChangesResponse {
+    accepted: usize,
+    rejected: usize,
+    #[serde(rename = "nextCursor")]
+    next_cursor: SyncCursorResponse,
+    conflicts: Vec<SyncConflictResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullChangesQuery {
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct EncryptedChangeResponse {
+    #[serde(rename = "recordId")]
+    record_id: String,
+    operation: String,
+    revision: i64,
+    #[serde(rename = "keyVersion")]
+    key_version: i32,
+    #[serde(rename = "ciphertextB64")]
+    ciphertext_b64: String,
+    #[serde(rename = "nonceB64")]
+    nonce_b64: String,
+    #[serde(rename = "aadB64", skip_serializing_if = "Option::is_none")]
+    aad_b64: Option<String>,
+    #[serde(rename = "payloadDigest")]
+    payload_digest: String,
+    #[serde(rename = "changedAt")]
+    changed_at: i64,
+    #[serde(rename = "deletedAt", skip_serializing_if = "Option::is_none")]
+    deleted_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PullChangesResponse {
+    changes: Vec<EncryptedChangeResponse>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: SyncCursorResponse,
+    #[serde(rename = "hasMore")]
+    has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AckChangesRequest {
+    cursor: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ExistingSyncItem {
+    revision: i64,
+    content_digest: String,
+}
+
+#[derive(Debug, FromRow)]
+struct SyncItemRow {
+    event_key: String,
+    operation: String,
+    revision: i64,
+    key_version: i32,
+    payload: Vec<u8>,
+    payload_nonce: Vec<u8>,
+    aad: Option<Vec<u8>>,
+    content_digest: String,
+    created_at: DateTime<Utc>,
+    deleted_at: Option<DateTime<Utc>>,
+    stream_position: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -149,6 +264,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/devices/me", get(get_current_device))
         .route("/v1/pairings", get(list_pairings).post(create_pairing))
         .route("/v1/pairings/claim", post(claim_pairing))
+        .route(
+            "/v1/pairings/{pairing_id}/changes",
+            get(pull_changes).post(push_changes),
+        )
+        .route("/v1/pairings/{pairing_id}/ack", post(ack_changes))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -295,6 +415,14 @@ async fn claim_pairing(
     .bind(pairing.id)
     .fetch_one(&mut *transaction)
     .await?;
+    sqlx::query(
+        "INSERT INTO pairing_streams (pairing_id, next_position)
+         VALUES ($1, 1)
+         ON CONFLICT (pairing_id) DO NOTHING",
+    )
+    .bind(pairing.id)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
 
     Ok(Json(updated))
@@ -316,6 +444,378 @@ async fn list_pairings(
     .await?;
 
     Ok(Json(PairingListResponse { pairings }))
+}
+
+async fn push_changes(
+    State(state): State<AppState>,
+    Path(pairing_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<PushChangesRequest>,
+) -> ApiResult<Json<PushChangesResponse>> {
+    let device = authenticate_pairing(&headers, &state, pairing_id).await?;
+    if request.changes.is_empty() || request.changes.len() > 100 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "每次上传需要包含 1 到 100 条变更",
+        ));
+    }
+
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO pairing_streams (pairing_id, next_position)
+         VALUES ($1, 1)
+         ON CONFLICT (pairing_id) DO NOTHING",
+    )
+    .bind(pairing_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    let mut accepted = 0;
+    let mut rejected = 0;
+    let mut conflicts = Vec::new();
+
+    for change in request.changes {
+        let decoded = decode_change(&change)?;
+        let existing = sqlx::query_as::<_, ExistingSyncItem>(
+            "SELECT revision, content_digest
+             FROM sync_items
+             WHERE pairing_id = $1 AND event_key = $2
+             FOR UPDATE",
+        )
+        .bind(pairing_id)
+        .bind(&change.record_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(existing) = existing {
+            if change.revision < existing.revision {
+                rejected += 1;
+                conflicts.push(SyncConflictResponse {
+                    record_id: change.record_id,
+                    local_revision: existing.revision,
+                    remote_revision: change.revision,
+                    local_digest: existing.content_digest,
+                    remote_digest: change.payload_digest,
+                });
+                continue;
+            }
+            if change.revision == existing.revision {
+                if change.payload_digest == existing.content_digest {
+                    accepted += 1;
+                    continue;
+                }
+                rejected += 1;
+                conflicts.push(SyncConflictResponse {
+                    record_id: change.record_id,
+                    local_revision: existing.revision,
+                    remote_revision: change.revision,
+                    local_digest: existing.content_digest,
+                    remote_digest: change.payload_digest,
+                });
+                continue;
+            }
+        }
+
+        let stream_position = sqlx::query_scalar::<_, i64>(
+            "UPDATE pairing_streams
+             SET next_position = next_position + 1, updated_at = now()
+             WHERE pairing_id = $1
+             RETURNING next_position - 1",
+        )
+        .bind(pairing_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO sync_items (
+                 id, pairing_id, event_key, source_device_id, payload, payload_nonce,
+                 content_digest, revision, operation, key_version, aad, deleted_at,
+                 stream_position
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             ON CONFLICT (pairing_id, event_key) DO UPDATE SET
+                 source_device_id = EXCLUDED.source_device_id,
+                 payload = EXCLUDED.payload,
+                 payload_nonce = EXCLUDED.payload_nonce,
+                 content_digest = EXCLUDED.content_digest,
+                 revision = EXCLUDED.revision,
+                 operation = EXCLUDED.operation,
+                 key_version = EXCLUDED.key_version,
+                 aad = EXCLUDED.aad,
+                 deleted_at = EXCLUDED.deleted_at,
+                 created_at = now(),
+                 stream_position = EXCLUDED.stream_position",
+        )
+        .bind(Uuid::new_v4())
+        .bind(pairing_id)
+        .bind(&change.record_id)
+        .bind(device.id)
+        .bind(decoded.ciphertext)
+        .bind(decoded.nonce)
+        .bind(&change.payload_digest)
+        .bind(change.revision)
+        .bind(&change.operation)
+        .bind(change.key_version)
+        .bind(decoded.aad)
+        .bind(decoded.deleted_at)
+        .bind(stream_position)
+        .execute(&mut *transaction)
+        .await?;
+
+        if change.operation == "tombstone" {
+            sqlx::query(
+                "INSERT INTO tombstones (id, pairing_id, event_key, source_device_id)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (pairing_id, event_key) DO UPDATE SET
+                   source_device_id = EXCLUDED.source_device_id,
+                   created_at = now()",
+            )
+            .bind(Uuid::new_v4())
+            .bind(pairing_id)
+            .bind(&change.record_id)
+            .bind(device.id)
+            .execute(&mut *transaction)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM tombstones WHERE pairing_id = $1 AND event_key = $2")
+                .bind(pairing_id)
+                .bind(&change.record_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        accepted += 1;
+    }
+
+    let current_position = sqlx::query_scalar::<_, i64>(
+        "SELECT next_position - 1 FROM pairing_streams WHERE pairing_id = $1",
+    )
+    .bind(pairing_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(Json(PushChangesResponse {
+        accepted,
+        rejected,
+        next_cursor: sync_cursor(pairing_id, current_position),
+        conflicts,
+    }))
+}
+
+async fn pull_changes(
+    State(state): State<AppState>,
+    Path(pairing_id): Path<Uuid>,
+    Query(query): Query<PullChangesQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<PullChangesResponse>> {
+    let device = authenticate_pairing(&headers, &state, pairing_id).await?;
+    let cursor = parse_cursor(query.cursor.as_deref())?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as i64;
+    let rows = sqlx::query_as::<_, SyncItemRow>(
+        "SELECT event_key, operation, revision, key_version, payload, payload_nonce,
+                aad, content_digest, created_at, deleted_at, stream_position
+         FROM sync_items
+         WHERE pairing_id = $1 AND source_device_id <> $2 AND stream_position > $3
+         ORDER BY stream_position ASC
+         LIMIT $4",
+    )
+    .bind(pairing_id)
+    .bind(device.id)
+    .bind(cursor)
+    .bind(limit + 1)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let has_more = rows.len() > limit as usize;
+    let wrapped_changes = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(encrypted_change_response)
+        .collect::<Vec<_>>();
+    let next_position = wrapped_changes
+        .last()
+        .map(|change| change.stream_position)
+        .unwrap_or(cursor);
+    let changes = wrapped_changes
+        .into_iter()
+        .map(|change| change.change)
+        .collect::<Vec<_>>();
+
+    Ok(Json(PullChangesResponse {
+        changes,
+        next_cursor: sync_cursor(pairing_id, next_position),
+        has_more,
+    }))
+}
+
+async fn ack_changes(
+    State(state): State<AppState>,
+    Path(pairing_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<AckChangesRequest>,
+) -> ApiResult<StatusCode> {
+    let device = authenticate_pairing(&headers, &state, pairing_id).await?;
+    let position = parse_cursor(Some(&request.cursor))?;
+    let max_position = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(stream_position), 0) FROM sync_items WHERE pairing_id = $1",
+    )
+    .bind(pairing_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if position > max_position {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "同步游标超出当前流位置",
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO sync_cursors (pairing_id, device_id, last_revision, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (pairing_id, device_id) DO UPDATE SET
+           last_revision = GREATEST(sync_cursors.last_revision, EXCLUDED.last_revision),
+           updated_at = now()",
+    )
+    .bind(pairing_id)
+    .bind(device.id)
+    .bind(position)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug)]
+struct DecodedChange {
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    aad: Option<Vec<u8>>,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+fn decode_change(change: &EncryptedChangeInput) -> ApiResult<DecodedChange> {
+    if change.record_id.trim().is_empty() || change.record_id.len() > 512 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "记录标识无效"));
+    }
+    if change.operation != "upsert" && change.operation != "tombstone" {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "同步操作类型无效"));
+    }
+    if change.revision < 0 || change.revision > i64::from(i32::MAX) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "记录版本无效"));
+    }
+    if !(1..=100).contains(&change.key_version) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "加密密钥版本无效"));
+    }
+    if change.payload_digest.len() != 64
+        || !change
+            .payload_digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "密文摘要格式无效"));
+    }
+    if change.ciphertext_b64.len() > 8 * 1024 * 1024 {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "单条密文过大"));
+    }
+    let ciphertext = BASE64
+        .decode(&change.ciphertext_b64)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "密文不是有效 Base64"))?;
+    let nonce = BASE64
+        .decode(&change.nonce_b64)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "随机数不是有效 Base64"))?;
+    if nonce.len() < 8 || nonce.len() > 64 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "随机数长度无效"));
+    }
+    let aad = change
+        .aad_b64
+        .as_deref()
+        .map(|value| {
+            BASE64
+                .decode(value)
+                .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "AAD 不是有效 Base64"))
+        })
+        .transpose()?;
+    if aad.as_ref().is_some_and(|value| value.len() > 4096) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "AAD 过大"));
+    }
+    let deleted_at = match change.deleted_at {
+        Some(value) => Some(
+            DateTime::<Utc>::from_timestamp_millis(value)
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "删除时间无效"))?,
+        ),
+        None => None,
+    };
+
+    Ok(DecodedChange {
+        ciphertext,
+        nonce,
+        aad,
+        deleted_at,
+    })
+}
+
+fn encrypted_change_response(row: SyncItemRow) -> EncryptedChangeResponseWithPosition {
+    EncryptedChangeResponseWithPosition {
+        change: EncryptedChangeResponse {
+            record_id: row.event_key,
+            operation: row.operation,
+            revision: row.revision,
+            key_version: row.key_version,
+            ciphertext_b64: BASE64.encode(row.payload),
+            nonce_b64: BASE64.encode(row.payload_nonce),
+            aad_b64: row.aad.map(|value| BASE64.encode(value)),
+            payload_digest: row.content_digest,
+            changed_at: row.created_at.timestamp_millis(),
+            deleted_at: row.deleted_at.map(|value| value.timestamp_millis()),
+        },
+        stream_position: row.stream_position,
+    }
+}
+
+#[derive(Debug)]
+struct EncryptedChangeResponseWithPosition {
+    change: EncryptedChangeResponse,
+    stream_position: i64,
+}
+
+async fn authenticate_pairing(
+    headers: &HeaderMap,
+    state: &AppState,
+    pairing_id: Uuid,
+) -> ApiResult<DeviceResponse> {
+    let device = authenticate(headers, &state.pool).await?;
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM pairings
+             WHERE id = $1 AND status = 'accepted'
+               AND (initiator_device_id = $2 OR claimant_device_id = $2)
+         )",
+    )
+    .bind(pairing_id)
+    .bind(device.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if !is_member {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "设备无权访问此配对"));
+    }
+    Ok(device)
+}
+
+fn parse_cursor(value: Option<&str>) -> ApiResult<i64> {
+    let raw = value.unwrap_or("0").trim();
+    let position = raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "同步游标格式无效"))?;
+    if position < 0 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "同步游标不能为负数"));
+    }
+    Ok(position)
+}
+
+fn sync_cursor(pairing_id: Uuid, position: i64) -> SyncCursorResponse {
+    SyncCursorResponse {
+        stream_id: pairing_id,
+        position: position.to_string(),
+        issued_at: Utc::now().timestamp_millis(),
+    }
 }
 
 async fn authenticate(headers: &HeaderMap, pool: &PgPool) -> ApiResult<DeviceResponse> {

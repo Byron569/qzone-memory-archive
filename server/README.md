@@ -10,9 +10,13 @@
 - `POST /v1/pairings`：创建 15 分钟有效的配对码
 - `POST /v1/pairings/claim`：使用配对码完成双端配对
 - `GET /v1/pairings`：列出当前设备参与的配对
+- `POST /v1/pairings/{id}/changes`：幂等上传客户端加密变更
+- `GET /v1/pairings/{id}/changes?cursor=0&limit=100`：按服务端游标拉取对端变更
+- `POST /v1/pairings/{id}/ack`：确认客户端已安全处理游标
 - PostgreSQL migrations：设备、配对、同步载荷、游标、删除标记和审计表
 
 同步载荷表中的 `payload` 必须是客户端端到端加密后的二进制；服务端不会尝试解析 QQ 内容。
+服务端游标与客户端记录版本分开维护，同一 `recordId` 的重复上传会幂等接受，版本冲突会返回冲突列表。
 
 ## 本地运行
 
