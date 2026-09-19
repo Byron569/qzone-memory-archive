@@ -57,6 +57,82 @@ export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_arc
 export const clearArchivedFeeds = () => invoke<number>("clear_archived_feeds");
 export const deleteAllAppData = () => invoke<void>("delete_all_app_data");
 
+/**
+ * A summary of a local, credential-free evidence package exchanged between
+ * two authorized accounts. The package itself is written/read by Rust after
+ * the user has selected a path in the native file picker.
+ */
+export interface RecoveryEvidencePackageSummary {
+  packageId: string;
+  exporterUin: string;
+  targetUin?: string | null;
+  createdAt: number;
+  importedAt?: number | null;
+  itemCount: number;
+}
+
+export const exportRecoveryEvidence = (path: string, targetUin?: string) =>
+  invoke<RecoveryEvidencePackageSummary>("export_recovery_evidence", { path, targetUin: targetUin || null });
+export const importRecoveryEvidence = (path: string) =>
+  invoke<RecoveryEvidencePackageSummary>("import_recovery_evidence", { path });
+export const listRecoveryEvidencePackages = () =>
+  invoke<RecoveryEvidencePackageSummary[]>("list_recovery_evidence_packages");
+
+/**
+ * A record found in an imported evidence package that is not yet present in
+ * the current account's local archive. Candidates are deliberately exposed
+ * as a review model rather than silently merging them into archive_feeds.
+ */
+export interface RecoveryEvidenceCandidate {
+  id: number;
+  packageId: string;
+  sourceUin: string;
+  sourceSide: string;
+  eventKey: string;
+  cellId?: string | null;
+  eventType: number;
+  eventTime: number;
+  title?: string | null;
+  content?: string | null;
+  eventSummary?: string | null;
+  actorUin?: string | null;
+  actorName?: string | null;
+  originalAuthorUin?: string | null;
+  originalAuthorName?: string | null;
+  pictureCount: number;
+  category?: string | null;
+  /** Backend matching confidence, e.g. "high", "medium", or "low". */
+  confidence?: string | null;
+  /** Human-readable explanation of why the record is a candidate. */
+  matchReason?: string | null;
+}
+
+export interface RecoveryEvidenceCandidatePage {
+  items: RecoveryEvidenceCandidate[];
+  total: number;
+}
+
+export interface RecoveryEvidenceMergeResult {
+  candidateId: number;
+  merged: boolean;
+  archiveId?: number | null;
+  message: string;
+}
+
+export const listRecoveryEvidenceCandidates = async (_limit = 20, _offset = 0) => {
+  const result = await invoke<
+    RecoveryEvidenceCandidatePage
+    | RecoveryEvidenceCandidate[]
+    | { candidates: RecoveryEvidenceCandidate[]; total?: number }
+  >("list_recovery_evidence_candidates", { limit: Math.min(100, Math.max(1, Math.floor(_limit))), offset: Math.max(0, Math.floor(_offset)) });
+  if (Array.isArray(result)) return { items: result, total: result.length };
+  if ("candidates" in result) return { items: result.candidates, total: result.total ?? result.candidates.length };
+  return result;
+};
+
+export const mergeRecoveryEvidenceItem = (candidateId: number) =>
+  invoke<RecoveryEvidenceMergeResult>("merge_recovery_evidence_item", { id: candidateId });
+
 export const openRecyclePasswordWindow = () => invoke<void>("open_recycle_password_window");
 export const prepareRecyclePasswordWindow = () => invoke<string>("prepare_recycle_password_window");
 export const checkRecyclePassword = () => invoke<string | null>("check_recycle_password");
