@@ -293,6 +293,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(pull_account_changes).post(push_account_changes),
         )
         .route("/v1/sync/ack", post(ack_account_changes))
+        .route("/v1/visits", post(register_visit))
+        .route("/v1/visits/stats", get(visit_stats))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
 
@@ -398,7 +400,7 @@ async fn register_device(
                     )
                     .bind(account_uin)
                     .bind(version)
-                    .bind(device_id)
+                    .bind(registered.0)
                     .bind(&request.public_key)
                     .bind(request.label.as_deref())
                     .execute(&mut *transaction)
@@ -1351,4 +1353,68 @@ async fn ack_account_changes(
     .execute(&state.pool)
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VisitRequest {
+    path: Option<String>,
+    referrer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VisitStatsResponse {
+    total: i64,
+    today: i64,
+    uniques: i64,
+}
+
+/// 记录一次网页访问（匿名：只保存来源 IP 的 SHA-256 摘要）。
+async fn register_visit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Option<VisitRequest>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let ip_hash = format!("{:x}", Sha256::digest(client_ip.as_bytes()));
+    let path = request
+        .as_ref()
+        .and_then(|request| request.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/");
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(256).collect::<String>());
+    sqlx::query(
+        "INSERT INTO page_visits (ip_hash, path, user_agent) VALUES ($1, $2, $3)",
+    )
+    .bind(ip_hash)
+    .bind(path)
+    .bind(user_agent)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 返回累计访问量、今日访问量与独立访客数。
+async fn visit_stats(State(state): State<AppState>) -> ApiResult<Json<VisitStatsResponse>> {
+    let row: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE visited_at > now() - interval '24 hours'), COUNT(DISTINCT ip_hash) FROM page_visits",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(VisitStatsResponse {
+        total: row.0,
+        today: row.1,
+        uniques: row.2,
+    }))
 }
