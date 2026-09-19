@@ -34,6 +34,12 @@ reqwest = { version = "0.12", default-features = false, features = ["cookies", "
 tokio = { version = "1", features = ["sync", "time"] }
 cookie = "0.18"
 url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38.2"
