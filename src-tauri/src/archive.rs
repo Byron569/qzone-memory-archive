@@ -9,8 +9,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection};
-use serde::Serialize;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::Manager;
 
@@ -227,6 +227,102 @@ struct ParsedFeed {
     raw_json: String,
 }
 
+const RECOVERY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const MAX_RECOVERY_EVIDENCE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_RECOVERY_EVIDENCE_ITEMS: usize = 100_000;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryEvidenceObservation {
+    kind: String,
+    source_side: String,
+    source_uin: String,
+    target_uin: Option<String>,
+    event_key: String,
+    cell_id: Option<String>,
+    event_type: i64,
+    event_time: i64,
+    title: Option<String>,
+    content: Option<String>,
+    event_summary: Option<String>,
+    actor_uin: Option<String>,
+    actor_name: Option<String>,
+    original_author_uin: Option<String>,
+    original_author_name: Option<String>,
+    picture_count: i64,
+    pictures_json: Option<String>,
+    video_json: Option<String>,
+    comments_json: Option<String>,
+    category: Option<String>,
+    raw_json: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryEvidencePackage {
+    schema_version: u32,
+    package_id: String,
+    exporter_uin: String,
+    target_uin: Option<String>,
+    created_at: i64,
+    observations: Vec<RecoveryEvidenceObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryEvidencePackageSummary {
+    package_id: String,
+    exporter_uin: String,
+    target_uin: Option<String>,
+    created_at: i64,
+    imported_at: Option<i64>,
+    item_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryEvidenceCandidate {
+    id: i64,
+    package_id: String,
+    source_uin: String,
+    source_side: String,
+    kind: String,
+    event_key: String,
+    cell_id: Option<String>,
+    event_type: i64,
+    event_time: i64,
+    title: Option<String>,
+    content: Option<String>,
+    event_summary: Option<String>,
+    actor_uin: Option<String>,
+    actor_name: Option<String>,
+    original_author_uin: Option<String>,
+    original_author_name: Option<String>,
+    picture_count: i64,
+    category: Option<String>,
+    confidence: String,
+    match_reason: String,
+    status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryEvidenceCandidatePage {
+    items: Vec<RecoveryEvidenceCandidate>,
+    total: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryEvidenceMergeResult {
+    candidate_id: i64,
+    kind: String,
+    status: String,
+    merged: bool,
+    archive_id: Option<i64>,
+    message: String,
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -401,7 +497,46 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            last_error TEXT,
            synced_at INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY(owner_uin,module,scope_key)
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS recovery_evidence_packages (
+           package_id TEXT PRIMARY KEY,
+           exporter_uin TEXT NOT NULL,
+           target_uin TEXT,
+           created_at INTEGER NOT NULL,
+           imported_at INTEGER NOT NULL,
+           item_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS recovery_evidence_items (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           package_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           source_side TEXT NOT NULL,
+           source_uin TEXT NOT NULL,
+           target_uin TEXT,
+           event_key TEXT NOT NULL,
+           cell_id TEXT,
+           event_type INTEGER NOT NULL DEFAULT 0,
+           event_time INTEGER NOT NULL DEFAULT 0,
+           title TEXT,
+           content TEXT,
+           event_summary TEXT,
+           actor_uin TEXT,
+           actor_name TEXT,
+           original_author_uin TEXT,
+           original_author_name TEXT,
+           picture_count INTEGER NOT NULL DEFAULT 0,
+           pictures_json TEXT,
+           video_json TEXT,
+           comments_json TEXT,
+           category TEXT,
+           raw_json TEXT NOT NULL,
+           merge_status TEXT NOT NULL DEFAULT 'pending',
+           merged_at INTEGER,
+           UNIQUE(package_id,kind,event_key),
+           FOREIGN KEY(package_id) REFERENCES recovery_evidence_packages(package_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_recovery_evidence_items_match
+           ON recovery_evidence_items(source_uin,cell_id,event_type,event_time);",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
     if connection
@@ -427,6 +562,28 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
             )
             .map_err(|error| format!("升级归档分类失败：{error}"))?;
     }
+    if connection
+        .prepare("SELECT merge_status FROM recovery_evidence_items LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute(
+                "ALTER TABLE recovery_evidence_items ADD COLUMN merge_status TEXT NOT NULL DEFAULT 'pending'",
+                [],
+            )
+            .map_err(|error| format!("升级双端证据状态失败：{error}"))?;
+    }
+    if connection
+        .prepare("SELECT merged_at FROM recovery_evidence_items LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute(
+                "ALTER TABLE recovery_evidence_items ADD COLUMN merged_at INTEGER",
+                [],
+            )
+            .map_err(|error| format!("升级双端合并时间失败：{error}"))?;
+    }
     migrate_legacy_dynamics(&mut connection)?;
     migrate_dynamic_categories(&mut connection)?;
     migrate_history_v1_records(&mut connection)?;
@@ -435,6 +592,238 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     migrate_history_guestbook_records(&mut connection)?;
     migrate_library_guestbook_timestamps(&mut connection)?;
     Ok(connection)
+}
+
+fn valid_recovery_uin(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 32 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn contains_sensitive_recovery_key(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_sensitive_recovery_key),
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            matches!(
+                key.as_str(),
+                "cookie"
+                    | "cookies"
+                    | "g_tk"
+                    | "gtk"
+                    | "useragent"
+                    | "user_agent"
+                    | "password"
+                    | "skey"
+                    | "p_skey"
+                    | "pt4_token"
+            ) || contains_sensitive_recovery_key(value)
+        }),
+        _ => false,
+    }
+}
+
+fn validate_recovery_evidence_package(package: &RecoveryEvidencePackage) -> Result<(), String> {
+    if package.schema_version != RECOVERY_EVIDENCE_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持的双端证据包版本：{}",
+            package.schema_version
+        ));
+    }
+    if package.package_id.len() > 128 || package.package_id.trim().is_empty() {
+        return Err("双端证据包编号无效".into());
+    }
+    if !valid_recovery_uin(&package.exporter_uin) {
+        return Err("双端证据包的导出账号无效".into());
+    }
+    if let Some(target_uin) = package.target_uin.as_deref() {
+        if !valid_recovery_uin(target_uin) {
+            return Err("双端证据包的目标账号无效".into());
+        }
+        if target_uin == package.exporter_uin.as_str() {
+            return Err("双端证据包的导出账号和目标账号不能相同".into());
+        }
+    }
+    if package.observations.len() > MAX_RECOVERY_EVIDENCE_ITEMS {
+        return Err(format!(
+            "双端证据包记录过多，最多支持 {} 条",
+            MAX_RECOVERY_EVIDENCE_ITEMS
+        ));
+    }
+    for observation in &package.observations {
+        if !matches!(observation.kind.as_str(), "interaction" | "dynamic") {
+            return Err("双端证据包包含未知记录类型".into());
+        }
+        if observation.source_side != "owner" || observation.source_uin != package.exporter_uin {
+            return Err("双端证据包的来源账号与导出账号不一致".into());
+        }
+        if observation.target_uin != package.target_uin {
+            return Err("双端证据包的目标账号信息不一致".into());
+        }
+        if observation.source_side.len() > 32
+            || observation.source_side.trim().is_empty()
+            || !valid_recovery_uin(&observation.source_uin)
+        {
+            return Err("双端证据包包含无效的来源信息".into());
+        }
+        if let Some(target_uin) = observation.target_uin.as_deref() {
+            if !valid_recovery_uin(target_uin) {
+                return Err("双端证据包包含无效的目标账号".into());
+            }
+        }
+        if observation.event_key.trim().is_empty() || observation.event_key.len() > 512 {
+            return Err("双端证据包包含无效的记录编号".into());
+        }
+        if observation.raw_json.len() > 4 * 1024 * 1024 {
+            return Err("双端证据包包含过大的原始记录".into());
+        }
+        let raw = serde_json::from_str::<Value>(&observation.raw_json)
+            .map_err(|_| "双端证据包包含无法解析的原始记录".to_string())?;
+        if contains_sensitive_recovery_key(&raw) {
+            return Err("双端证据包疑似包含登录凭证，已拒绝导入".into());
+        }
+    }
+    Ok(())
+}
+
+fn build_recovery_evidence_package(
+    connection: &Connection,
+    exporter_uin: &str,
+    target_uin: Option<&str>,
+) -> Result<RecoveryEvidencePackage, String> {
+    let mut observations = Vec::new();
+    let target_cell_ids = if let Some(target_uin) = target_uin {
+        let mut statement = connection
+            .prepare(
+                "SELECT cell_id FROM archive_dynamics
+                 WHERE owner_uin=?1 AND author_uin=?2 AND cell_id IS NOT NULL",
+            )
+            .map_err(|error| format!("准备双端目标动态筛选失败：{error}"))?;
+        statement
+            .query_map(params![exporter_uin, target_uin], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("查询双端目标动态筛选失败：{error}"))?
+            .filter_map(Result::ok)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let mut feeds = connection
+        .prepare(
+            "SELECT feed_key,cell_id,event_type,event_time,title,content,event_summary,
+                    actor_uin,actor_name,original_author_uin,original_author_name,picture_count,
+                    pictures_json,video_json,comments_json,raw_json
+             FROM archive_feeds WHERE owner_uin=?1 ORDER BY event_time DESC,id DESC",
+        )
+        .map_err(|error| format!("准备双端动态导出失败：{error}"))?;
+    let feed_rows = feeds
+        .query_map(params![exporter_uin], |row| {
+            let feed_key = row.get::<_, String>(0)?;
+            Ok(RecoveryEvidenceObservation {
+                kind: "interaction".into(),
+                source_side: "owner".into(),
+                source_uin: exporter_uin.to_string(),
+                target_uin: None,
+                event_key: format!("feed:{feed_key}"),
+                cell_id: row.get(1)?,
+                event_type: row.get(2)?,
+                event_time: row.get(3)?,
+                title: row.get(4)?,
+                content: row.get(5)?,
+                event_summary: row.get(6)?,
+                actor_uin: row.get(7)?,
+                actor_name: row.get(8)?,
+                original_author_uin: row.get(9)?,
+                original_author_name: row.get(10)?,
+                picture_count: row.get(11)?,
+                pictures_json: row.get(12)?,
+                video_json: row.get(13)?,
+                comments_json: row.get(14)?,
+                category: None,
+                raw_json: row.get(15)?,
+            })
+        })
+        .map_err(|error| format!("查询双端动态导出失败：{error}"))?;
+    for row in feed_rows {
+        let mut observation = row.map_err(|error| format!("读取双端动态导出失败：{error}"))?;
+        if let Some(target_uin) = target_uin {
+            let related = observation.actor_uin.as_deref() == Some(target_uin)
+                || observation.original_author_uin.as_deref() == Some(target_uin)
+                || observation
+                    .cell_id
+                    .as_ref()
+                    .is_some_and(|cell_id| target_cell_ids.contains(cell_id));
+            if !related {
+                continue;
+            }
+            observation.target_uin = Some(target_uin.to_string());
+        }
+        observations.push(observation);
+    }
+    let mut dynamics = connection
+        .prepare(
+            "SELECT cell_id,published_at,content,author_uin,author_name,category,
+                    pictures_json,video_json,raw_original_json
+             FROM archive_dynamics WHERE owner_uin=?1 ORDER BY published_at DESC,id DESC",
+        )
+        .map_err(|error| format!("准备双端原动态导出失败：{error}"))?;
+    let dynamic_rows = dynamics
+        .query_map(params![exporter_uin], |row| {
+            let cell_id = row.get::<_, String>(0)?;
+            let author_uin = row.get::<_, Option<String>>(3)?;
+            let author_name = row.get::<_, Option<String>>(4)?;
+            Ok(RecoveryEvidenceObservation {
+                kind: "dynamic".into(),
+                source_side: "owner".into(),
+                source_uin: exporter_uin.to_string(),
+                target_uin: None,
+                event_key: format!("dynamic:{cell_id}"),
+                cell_id: Some(cell_id),
+                event_type: 0,
+                event_time: row.get(1)?,
+                title: None,
+                content: row.get(2)?,
+                event_summary: None,
+                actor_uin: author_uin.clone(),
+                actor_name: author_name.clone(),
+                original_author_uin: author_uin,
+                original_author_name: author_name,
+                picture_count: 0,
+                pictures_json: row.get(6)?,
+                video_json: row.get(7)?,
+                comments_json: None,
+                category: row.get(5)?,
+                raw_json: row.get(8)?,
+            })
+        })
+        .map_err(|error| format!("查询双端原动态导出失败：{error}"))?;
+    for row in dynamic_rows {
+        let mut observation =
+            row.map_err(|error| format!("读取双端原动态导出失败：{error}"))?;
+        if let Some(target_uin) = target_uin {
+            if observation.original_author_uin.as_deref() != Some(target_uin) {
+                continue;
+            }
+            observation.target_uin = Some(target_uin.to_string());
+        }
+        observations.push(observation);
+    }
+    let created_at = now();
+    let package_id = format!(
+        "qza-{created_at}-{:016x}",
+        stable_feed_hash(&json!({
+            "exporterUin": exporter_uin,
+            "targetUin": target_uin,
+            "createdAt": created_at,
+            "itemCount": observations.len(),
+            "observations": &observations
+        }))
+    );
+    Ok(RecoveryEvidencePackage {
+        schema_version: RECOVERY_EVIDENCE_SCHEMA_VERSION,
+        package_id,
+        exporter_uin: exporter_uin.to_string(),
+        target_uin: target_uin.map(str::to_owned),
+        created_at,
+        observations,
+    })
 }
 
 fn migrate_library_guestbook_timestamps(connection: &mut Connection) -> Result<(), String> {
@@ -3993,6 +4382,557 @@ pub async fn delete_all_app_data(
 }
 
 #[tauri::command]
+pub async fn export_recovery_evidence(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    path: String,
+    target_uin: Option<String>,
+) -> Result<RecoveryEvidencePackageSummary, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("没有选择双端证据包保存位置".into());
+    }
+    let owner_uin = login.qzone_auth().await?.uin;
+    let target_uin = target_uin
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let target_uin = target_uin.ok_or_else(|| "请先填写经过授权的对方 QQ 号".to_string())?;
+    if !valid_recovery_uin(&target_uin) || target_uin.as_str() == owner_uin.as_str() {
+        return Err("对方 QQ 号无效，或不能与当前登录账号相同".into());
+    }
+    let connection = open_database(&app)?;
+    let package = build_recovery_evidence_package(&connection, &owner_uin, Some(&target_uin))?;
+    validate_recovery_evidence_package(&package)?;
+    let payload = serde_json::to_string_pretty(&package)
+        .map_err(|error| format!("生成双端证据包失败：{error}"))?;
+    if payload.len() as u64 > MAX_RECOVERY_EVIDENCE_BYTES {
+        return Err(format!(
+            "双端证据包超过 {} MB，请先缩小本地归档范围",
+            MAX_RECOVERY_EVIDENCE_BYTES / 1024 / 1024
+        ));
+    }
+    fs::write(path, payload).map_err(|error| format!("保存双端证据包失败：{error}"))?;
+    Ok(RecoveryEvidencePackageSummary {
+        package_id: package.package_id,
+        exporter_uin: package.exporter_uin,
+        target_uin: package.target_uin,
+        created_at: package.created_at,
+        imported_at: None,
+        item_count: package.observations.len() as u64,
+    })
+}
+
+#[tauri::command]
+pub fn import_recovery_evidence(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<RecoveryEvidencePackageSummary, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("没有选择要导入的双端证据包".into());
+    }
+    let metadata = fs::metadata(path).map_err(|error| format!("读取双端证据包失败：{error}"))?;
+    if metadata.len() > MAX_RECOVERY_EVIDENCE_BYTES {
+        return Err(format!(
+            "双端证据包超过 {} MB，已拒绝导入",
+            MAX_RECOVERY_EVIDENCE_BYTES / 1024 / 1024
+        ));
+    }
+    let payload =
+        fs::read_to_string(path).map_err(|error| format!("读取双端证据包失败：{error}"))?;
+    let value: Value =
+        serde_json::from_str(&payload).map_err(|error| format!("双端证据包不是有效 JSON：{error}"))?;
+    if contains_sensitive_recovery_key(&value) {
+        return Err("双端证据包疑似包含登录凭证，已拒绝导入".into());
+    }
+    let package: RecoveryEvidencePackage = serde_json::from_value(value)
+        .map_err(|error| format!("双端证据包格式不兼容：{error}"))?;
+    validate_recovery_evidence_package(&package)?;
+    let mut connection = open_database(&app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始导入双端证据包失败：{error}"))?;
+    let imported_at = now();
+    transaction
+        .execute(
+            "INSERT INTO recovery_evidence_packages
+             (package_id,exporter_uin,target_uin,created_at,imported_at,item_count)
+             VALUES (?1,?2,?3,?4,?5,0)
+             ON CONFLICT(package_id) DO NOTHING",
+            params![
+                package.package_id,
+                package.exporter_uin,
+                package.target_uin,
+                package.created_at,
+                imported_at
+            ],
+        )
+        .map_err(|error| format!("保存双端证据包信息失败：{error}"))?;
+    let (stored_exporter, stored_created_at, stored_imported_at) = transaction
+        .query_row(
+            "SELECT exporter_uin,created_at,imported_at
+             FROM recovery_evidence_packages WHERE package_id=?1",
+            params![package.package_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("校验已导入双端证据包失败：{error}"))?;
+    if stored_exporter != package.exporter_uin || stored_created_at != package.created_at {
+        return Err("双端证据包编号与已有内容不一致，已拒绝导入".into());
+    }
+    for observation in &package.observations {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO recovery_evidence_items
+                 (package_id,kind,source_side,source_uin,target_uin,event_key,cell_id,event_type,
+                  event_time,title,content,event_summary,actor_uin,actor_name,original_author_uin,
+                  original_author_name,picture_count,pictures_json,video_json,comments_json,category,raw_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                params![
+                    package.package_id,
+                    observation.kind,
+                    observation.source_side,
+                    observation.source_uin,
+                    observation.target_uin,
+                    observation.event_key,
+                    observation.cell_id,
+                    observation.event_type,
+                    observation.event_time,
+                    observation.title,
+                    observation.content,
+                    observation.event_summary,
+                    observation.actor_uin,
+                    observation.actor_name,
+                    observation.original_author_uin,
+                    observation.original_author_name,
+                    observation.picture_count,
+                    observation.pictures_json,
+                    observation.video_json,
+                    observation.comments_json,
+                    observation.category,
+                    observation.raw_json,
+                ],
+            )
+            .map_err(|error| format!("保存双端证据记录失败：{error}"))?;
+    }
+    let item_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM recovery_evidence_items WHERE package_id=?1",
+            params![package.package_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计双端证据记录失败：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE recovery_evidence_packages SET item_count=?1 WHERE package_id=?2",
+            params![item_count, package.package_id],
+        )
+        .map_err(|error| format!("更新双端证据统计失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交双端证据包失败：{error}"))?;
+    Ok(RecoveryEvidencePackageSummary {
+        package_id: package.package_id,
+        exporter_uin: package.exporter_uin,
+        target_uin: package.target_uin,
+        created_at: package.created_at,
+        imported_at: Some(stored_imported_at),
+        item_count: item_count.max(0) as u64,
+    })
+}
+
+#[tauri::command]
+pub fn list_recovery_evidence_packages(
+    app: tauri::AppHandle,
+) -> Result<Vec<RecoveryEvidencePackageSummary>, String> {
+    let connection = open_database(&app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT package_id,exporter_uin,target_uin,created_at,imported_at,item_count
+             FROM recovery_evidence_packages ORDER BY imported_at DESC,package_id DESC",
+        )
+        .map_err(|error| format!("准备双端证据包列表失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RecoveryEvidencePackageSummary {
+                package_id: row.get(0)?,
+                exporter_uin: row.get(1)?,
+                target_uin: row.get(2)?,
+                created_at: row.get(3)?,
+                imported_at: Some(row.get(4)?),
+                item_count: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })
+        .map_err(|error| format!("查询双端证据包列表失败：{error}"))?;
+    rows.map(|row| row.map_err(|error| format!("读取双端证据包列表失败：{error}")))
+        .collect()
+}
+
+#[tauri::command]
+pub async fn list_recovery_evidence_candidates(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    limit: u32,
+    offset: u32,
+) -> Result<RecoveryEvidenceCandidatePage, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let limit = limit.clamp(1, 100);
+    let mut statement = connection
+        .prepare(
+            "SELECT e.id,e.package_id,p.exporter_uin,e.kind,e.event_key,e.cell_id,e.event_type,
+                    e.event_time,e.title,e.content,e.event_summary,e.actor_uin,e.actor_name,
+                    e.original_author_uin,e.original_author_name,e.picture_count,e.category,
+                    CASE
+                      WHEN e.merge_status='merged' THEN 'merged'
+                      WHEN e.kind='dynamic' AND EXISTS(
+                        SELECT 1 FROM archive_dynamics d
+                        WHERE d.owner_uin=?1 AND d.cell_id=e.cell_id
+                      ) THEN 'matched'
+                      WHEN e.kind='interaction' AND EXISTS(
+                        SELECT 1 FROM archive_feeds f
+                        WHERE f.owner_uin=?1 AND f.cell_id=e.cell_id
+                          AND f.event_type=e.event_type
+                          AND ((f.actor_uin IS NULL AND e.actor_uin IS NULL) OR f.actor_uin=e.actor_uin)
+                      ) THEN 'matched'
+                      ELSE 'pending'
+                    END,
+                    CASE WHEN e.cell_id IS NOT NULL THEN 'high' ELSE 'medium' END,
+                    CASE WHEN e.cell_id IS NOT NULL THEN '按动态 ID 和互动类型匹配' ELSE '缺少动态 ID，需要人工核对' END
+             FROM recovery_evidence_items e
+             JOIN recovery_evidence_packages p ON p.package_id=e.package_id
+             WHERE p.exporter_uin<>?1 AND p.target_uin=?1
+               AND e.merge_status='pending'
+               AND NOT (
+                 (e.kind='dynamic' AND EXISTS(
+                   SELECT 1 FROM archive_dynamics d
+                   WHERE d.owner_uin=?1 AND d.cell_id=e.cell_id
+                 ))
+                 OR
+                 (e.kind='interaction' AND EXISTS(
+                   SELECT 1 FROM archive_feeds f
+                   WHERE f.owner_uin=?1 AND f.cell_id=e.cell_id
+                     AND f.event_type=e.event_type
+                     AND ((f.actor_uin IS NULL AND e.actor_uin IS NULL) OR f.actor_uin=e.actor_uin)
+                 ))
+               )
+             ORDER BY CASE
+                WHEN e.merge_status='merged' THEN 2
+                WHEN e.kind='dynamic' AND EXISTS(
+                  SELECT 1 FROM archive_dynamics d
+                  WHERE d.owner_uin=?1 AND d.cell_id=e.cell_id
+                ) THEN 1
+                WHEN e.kind='interaction' AND EXISTS(
+                  SELECT 1 FROM archive_feeds f
+                  WHERE f.owner_uin=?1 AND f.cell_id=e.cell_id
+                    AND f.event_type=e.event_type
+                    AND ((f.actor_uin IS NULL AND e.actor_uin IS NULL) OR f.actor_uin=e.actor_uin)
+                ) THEN 1
+                ELSE 0
+             END,e.event_time DESC,e.id DESC
+             LIMIT ?2 OFFSET ?3",
+        )
+        .map_err(|error| format!("准备双端恢复候选失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin, limit, offset], |row| {
+            Ok(RecoveryEvidenceCandidate {
+                id: row.get(0)?,
+                package_id: row.get(1)?,
+                source_uin: row.get(2)?,
+                source_side: "counterpart".into(),
+                kind: row.get(3)?,
+                event_key: row.get(4)?,
+                cell_id: row.get(5)?,
+                event_type: row.get(6)?,
+                event_time: row.get(7)?,
+                title: row.get(8)?,
+                content: row.get(9)?,
+                event_summary: row.get(10)?,
+                actor_uin: row.get(11)?,
+                actor_name: row.get(12)?,
+                original_author_uin: row.get(13)?,
+                original_author_name: row.get(14)?,
+                picture_count: row.get(15)?,
+                category: row.get(16)?,
+                status: row.get(17)?,
+                confidence: row.get(18)?,
+                match_reason: row.get(19)?,
+            })
+        })
+        .map_err(|error| format!("查询双端恢复候选失败：{error}"))?;
+    let items = rows
+        .map(|row| row.map_err(|error| format!("读取双端恢复候选失败：{error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let total = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM recovery_evidence_items e
+             JOIN recovery_evidence_packages p ON p.package_id=e.package_id
+             WHERE p.exporter_uin<>?1 AND p.target_uin=?1
+               AND e.merge_status='pending'
+               AND NOT (
+                 (e.kind='dynamic' AND EXISTS(
+                   SELECT 1 FROM archive_dynamics d
+                   WHERE d.owner_uin=?1 AND d.cell_id=e.cell_id
+                 ))
+                 OR
+                 (e.kind='interaction' AND EXISTS(
+                   SELECT 1 FROM archive_feeds f
+                   WHERE f.owner_uin=?1 AND f.cell_id=e.cell_id
+                     AND f.event_type=e.event_type
+                     AND ((f.actor_uin IS NULL AND e.actor_uin IS NULL) OR f.actor_uin=e.actor_uin)
+                 ))
+               )",
+            params![owner_uin],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计双端恢复候选失败：{error}"))?;
+    Ok(RecoveryEvidenceCandidatePage {
+        items,
+        total: total.max(0) as u64,
+    })
+}
+
+#[tauri::command]
+pub async fn merge_recovery_evidence_item(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    id: i64,
+) -> Result<RecoveryEvidenceMergeResult, String> {
+    if id <= 0 {
+        return Err("双端恢复记录编号无效".into());
+    }
+    let owner_uin = login.qzone_auth().await?.uin;
+    let mut connection = open_database(&app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始合并双端恢复记录失败：{error}"))?;
+    let evidence = transaction
+        .query_row(
+            "SELECT e.package_id,p.exporter_uin,e.kind,e.event_key,e.cell_id,e.event_type,
+                    e.event_time,e.title,e.content,e.event_summary,e.actor_uin,e.actor_name,
+                    e.original_author_uin,e.original_author_name,e.picture_count,e.pictures_json,
+                    e.video_json,e.comments_json,e.category,e.raw_json
+             FROM recovery_evidence_items e
+             JOIN recovery_evidence_packages p ON p.package_id=e.package_id
+             WHERE e.id=?1 AND p.exporter_uin<>?2 AND p.target_uin=?2",
+            params![id, owner_uin],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, String>(19)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取待合并双端记录失败：{error}"))?
+        .ok_or_else(|| "双端恢复记录不存在，或不属于已授权的对方证据".to_string())?;
+    let (
+        package_id,
+        _exporter_uin,
+        kind,
+        event_key,
+        cell_id,
+        event_type,
+        event_time,
+        title,
+        content,
+        event_summary,
+        actor_uin,
+        actor_name,
+        original_author_uin,
+        original_author_name,
+        picture_count,
+        pictures_json,
+        video_json,
+        comments_json,
+        category,
+        raw_json,
+    ) = evidence;
+    let (status, archive_id, message) = if kind == "dynamic" {
+        let cell_id = cell_id.ok_or_else(|| "该恢复记录缺少动态 ID，无法合并".to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT id FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2",
+                params![owner_uin, cell_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("检查动态是否已存在失败：{error}"))?;
+        if let Some(existing_id) = existing {
+            transaction
+                .execute(
+                    "UPDATE recovery_evidence_items SET merge_status='matched' WHERE id=?1",
+                    params![id],
+                )
+                .map_err(|error| format!("更新双端恢复状态失败：{error}"))?;
+            (
+                "matched".to_string(),
+                Some(existing_id),
+                "本地已有相同动态，未重复写入".to_string(),
+            )
+        } else {
+            let category = if original_author_uin.as_deref() == Some(owner_uin.as_str()) {
+                "self"
+            } else if category.as_deref() == Some("guestbook") {
+                "guestbook"
+            } else {
+                "other"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO archive_dynamics
+                     (owner_uin,cell_id,published_at,content,author_uin,author_name,category,
+                      pictures_json,video_json,raw_original_json,archived_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    params![
+                        owner_uin,
+                        cell_id,
+                        event_time,
+                        content,
+                        original_author_uin,
+                        original_author_name,
+                        category,
+                        pictures_json,
+                        video_json,
+                        raw_json,
+                        now()
+                    ],
+                )
+                .map_err(|error| format!("合并双端动态失败：{error}"))?;
+            let archive_id = transaction.last_insert_rowid();
+            (
+                "merged".to_string(),
+                Some(archive_id),
+                "已将对方证据中的动态加入本地归档".to_string(),
+            )
+        }
+    } else if kind == "interaction" {
+        let feed_key = format!("recovery:{package_id}:{event_key}");
+        let existing = if let Some(cell_id) = cell_id.as_deref() {
+            transaction
+                .query_row(
+                    "SELECT id FROM archive_feeds
+                     WHERE owner_uin=?1 AND cell_id=?2 AND event_type=?3
+                       AND ((actor_uin IS NULL AND ?4 IS NULL) OR actor_uin=?4)
+                     LIMIT 1",
+                    params![owner_uin, cell_id, event_type, actor_uin],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+        } else {
+            transaction
+                .query_row(
+                    "SELECT id FROM archive_feeds
+                     WHERE owner_uin=?1 AND cell_id IS NULL AND event_type=?2
+                       AND event_time=?3
+                       AND ((actor_uin IS NULL AND ?4 IS NULL) OR actor_uin=?4)
+                       AND TRIM(COALESCE(content,''))=TRIM(COALESCE(?5,''))
+                     LIMIT 1",
+                    params![owner_uin, event_type, event_time, actor_uin, content],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+        }
+        .map_err(|error| format!("检查互动是否已存在失败：{error}"))?;
+        if let Some(existing_id) = existing {
+            transaction
+                .execute(
+                    "UPDATE recovery_evidence_items SET merge_status='matched' WHERE id=?1",
+                    params![id],
+                )
+                .map_err(|error| format!("更新双端恢复状态失败：{error}"))?;
+            (
+                "matched".to_string(),
+                Some(existing_id),
+                "本地已有相同互动，未重复写入".to_string(),
+            )
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO archive_feeds
+                     (owner_uin,feed_key,cell_id,event_type,event_time,title,content,event_summary,
+                      actor_uin,actor_name,original_author_uin,original_author_name,picture_count,
+                      pictures_json,video_json,comments_json,raw_json,archived_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                    params![
+                        owner_uin,
+                        feed_key,
+                        cell_id,
+                        event_type,
+                        event_time,
+                        title,
+                        content,
+                        event_summary,
+                        actor_uin,
+                        actor_name,
+                        original_author_uin,
+                        original_author_name,
+                        picture_count,
+                        pictures_json,
+                        video_json,
+                        comments_json,
+                        raw_json,
+                        now()
+                    ],
+                )
+                .map_err(|error| format!("合并双端互动失败：{error}"))?;
+            let archive_id = transaction.last_insert_rowid();
+            (
+                "merged".to_string(),
+                Some(archive_id),
+                "已将对方证据中的互动加入本地归档".to_string(),
+            )
+        }
+    } else {
+        return Err("双端恢复记录类型不受支持".into());
+    };
+    transaction
+        .execute(
+            "UPDATE recovery_evidence_items
+             SET merge_status=?1,merged_at=CASE WHEN ?1='merged' THEN ?2 ELSE merged_at END
+             WHERE id=?3",
+            params![status, now(), id],
+        )
+        .map_err(|error| format!("保存双端合并状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交双端恢复合并失败：{error}"))?;
+    Ok(RecoveryEvidenceMergeResult {
+        candidate_id: id,
+        kind,
+        merged: status == "merged",
+        status,
+        archive_id,
+        message,
+    })
+}
+
+#[tauri::command]
 pub async fn list_interactors(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
@@ -4684,12 +5624,27 @@ pub async fn list_qzone_library_years(
 mod tests {
     use super::{
         advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
-        comment_from_values, library_created_at, merge_comments, migrate_history_guestbook_records,
-        migrate_library_guestbook_timestamps, parse_feed, parse_feed_cursor, serialize_query_pairs,
-        skip_probe_offsets, video_cover_url, video_urls, ArchiveCheckpoint, FeedCursorDetails,
+        comment_from_values, contains_sensitive_recovery_key, library_created_at, merge_comments,
+        migrate_history_guestbook_records, migrate_library_guestbook_timestamps, parse_feed,
+        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, video_cover_url, video_urls,
+        ArchiveCheckpoint, FeedCursorDetails,
     };
     use rusqlite::{params, Connection};
     use serde_json::json;
+
+    #[test]
+    fn rejects_credentials_inside_evidence_payloads() {
+        assert!(contains_sensitive_recovery_key(&json!({
+            "original": {"cell_summary": {"summary": "保留正文"}},
+            "cookies": "secret"
+        })));
+        assert!(contains_sensitive_recovery_key(&json!({
+            "nested": [{"g_tk": 123456}]
+        })));
+        assert!(!contains_sensitive_recovery_key(&json!({
+            "original": {"cell_summary": {"summary": "保留正文"}}
+        })));
+    }
 
     #[test]
     fn parses_guestbook_wall_clock_time_after_zero_modify_time() {
