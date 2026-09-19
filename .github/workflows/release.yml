@@ -1,5 +1,8 @@
 name: "打包发布"
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
