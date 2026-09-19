@@ -33,6 +33,9 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 双端协作恢复的配对、端到端加密、游标同步和冲突处理边界见
 [远程同步协议草案](docs/REMOTE_SYNC_PROTOCOL.md)。当前版本先使用本地证据包交换，不要求公网服务器。
 
+远程同步服务基础版位于 [`server/`](server/README.md)，包含 PostgreSQL 迁移、设备注册、双端配对和健康检查。
+桌面端尚未默认连接远程服务；正式启用前应先完成 HTTPS、客户端加密载荷和服务器备份配置。
+
 ## 界面预览
 
 ![本地归档概览与互动排行榜](public/runtime/仪表盘.png)

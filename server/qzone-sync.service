@@ -1,0 +1,23 @@
+[Unit]
+Description=Qzone bilateral recovery sync API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qzone-sync
+Group=qzone-sync
+WorkingDirectory=/opt/qzone-sync
+EnvironmentFile=/etc/qzone-sync/server.env
+ExecStart=/opt/qzone-sync/qzone-sync-server
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/qzone-sync
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
