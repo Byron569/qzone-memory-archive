@@ -10,8 +10,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
-import { deleteAllAppData, exportRecoveryEvidence, importRecoveryEvidence, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary } from "../utils/qzone";
-import { claimRemotePairing, createRemotePairing, getRemoteSyncConfig, listRemotePairings, registerRemoteDevice, saveRemoteSyncEndpoint, type RemotePairing, type RemotePairingInvitation, type RemoteSyncConfig } from "../utils/remoteSync";
+import { deleteAllAppData, exportRecoveryEvidence, importRecoveryEvidence, importRecoverySyncPackage, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, prepareRecoverySyncPackage, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary, type RecoveryEvidenceSyncPackage } from "../utils/qzone";
+import { ackRemoteChanges, claimRemotePairing, createRemotePairing, decryptRemotePayload, encryptRecoverySyncBatch, getRemoteSyncConfig, listRemotePairings, pullRemoteChanges, pushRemoteChanges, registerRemoteDevice, saveRemoteSyncEndpoint, type RemotePairing, type RemotePairingInvitation, type RemoteSyncConfig } from "../utils/remoteSync";
 
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
@@ -38,7 +38,7 @@ const remoteDeviceLabel = ref("");
 const remoteClaimCode = ref("");
 const remoteInvitation = ref<RemotePairingInvitation | null>(null);
 const remotePairings = ref<RemotePairing[]>([]);
-const remoteBusy = ref<"save" | "register" | "create" | "claim" | "refresh" | null>(null);
+const remoteBusy = ref<"save" | "register" | "create" | "claim" | "refresh" | "push" | "pull" | null>(null);
 const remoteNotice = ref("");
 
 const evidenceFilter = [{ name: "QQ 空间双端证据包", extensions: ["qzone-evidence", "json"] }];
@@ -255,6 +255,126 @@ async function claimPairing() {
   }
 }
 
+function acceptedRemotePairing() {
+  return remotePairings.value.find((pairing) => pairing.status === "accepted") || null;
+}
+
+function peerPublicKey(pairing: RemotePairing) {
+  const localServerDeviceId = remoteConfig.value?.serverDeviceId;
+  if (!localServerDeviceId) return null;
+  if (pairing.initiatorDeviceId === localServerDeviceId) return pairing.claimantPublicKey || null;
+  if (pairing.claimantDeviceId === localServerDeviceId) return pairing.initiatorPublicKey || null;
+  return null;
+}
+
+function remoteCursorKey(pairingId: string) {
+  return `qzone-remote-sync-cursor:${pairingId}`;
+}
+
+function syncPackageMetadata(pkg: RecoveryEvidenceSyncPackage) {
+  return {
+    schemaVersion: pkg.schemaVersion,
+    packageId: pkg.packageId,
+    exporterUin: pkg.exporterUin,
+    targetUin: pkg.targetUin ?? null,
+    createdAt: pkg.createdAt,
+  };
+}
+
+async function pushRemoteEvidence() {
+  if (remoteBusy.value) return;
+  const pairing = acceptedRemotePairing();
+  const key = pairing ? peerPublicKey(pairing) : null;
+  const targetUin = evidenceTargetUin.value.trim();
+  if (!pairing || !key) {
+    error.value = "请先完成至少一组远程配对";
+    return;
+  }
+  if (!/^\d+$/.test(targetUin)) {
+    error.value = "请先填写经过授权的对方 QQ 号，作为同步目标";
+    return;
+  }
+  remoteBusy.value = "push";
+  remoteNotice.value = "";
+  try {
+    const pkg = await prepareRecoverySyncPackage(targetUin);
+    const metadata = syncPackageMetadata(pkg);
+    let uploaded = 0;
+    for (let offset = 0; offset < pkg.observations.length; offset += 100) {
+      const changes = await encryptRecoverySyncBatch({
+        pairingId: pairing.pairingId,
+        peerPublicKey: key,
+        package: metadata,
+        observations: pkg.observations.slice(offset, offset + 100),
+      });
+      const result = await pushRemoteChanges(pairing.pairingId, changes);
+      uploaded += result.accepted;
+    }
+    remoteNotice.value = pkg.observations.length
+      ? `已将 ${uploaded} 条本地证据加密上传。对方刷新后可拉取并审核。`
+      : "当前没有与目标账号相关的本地证据可上传。";
+  } catch (reason) {
+    error.value = `上传远程证据失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
+async function pullRemoteEvidence() {
+  if (remoteBusy.value) return;
+  const pairing = acceptedRemotePairing();
+  const key = pairing ? peerPublicKey(pairing) : null;
+  if (!pairing || !key) {
+    error.value = "请先完成至少一组远程配对";
+    return;
+  }
+  remoteBusy.value = "pull";
+  remoteNotice.value = "";
+  try {
+    let cursor = localStorage.getItem(remoteCursorKey(pairing.pairingId)) || undefined;
+    let pulled = 0;
+    let imported = 0;
+    do {
+      const page = await pullRemoteChanges(pairing.pairingId, cursor, 100);
+      const packages = new Map<string, RecoveryEvidenceSyncPackage>();
+      for (const change of page.changes) {
+        const decoded = await decryptRemotePayload(pairing.pairingId, key, change) as Partial<RecoveryEvidenceSyncPackage> & { observation?: RecoveryEvidenceSyncPackage["observations"][number] };
+        if (!decoded.packageId || !decoded.exporterUin || !decoded.observation) continue;
+        const current = packages.get(decoded.packageId);
+        if (current) current.observations.push(decoded.observation);
+        else packages.set(decoded.packageId, {
+          schemaVersion: decoded.schemaVersion || 1,
+          packageId: decoded.packageId,
+          exporterUin: decoded.exporterUin,
+          targetUin: decoded.targetUin,
+          createdAt: decoded.createdAt || Math.floor(Date.now() / 1000),
+          observations: [decoded.observation],
+        });
+        pulled += 1;
+      }
+      for (const pkg of packages.values()) {
+        const result = await importRecoverySyncPackage(pkg);
+        imported += result.itemCount;
+        await refreshEvidencePackages();
+      }
+      cursor = page.nextCursor.position;
+      if (!page.hasMore) {
+        await ackRemoteChanges(pairing.pairingId, cursor);
+        localStorage.setItem(remoteCursorKey(pairing.pairingId), cursor);
+      }
+      if (!page.hasMore) break;
+    } while (true);
+    await refreshEvidenceCandidates();
+    remoteNotice.value = pulled
+      ? `已解密拉取 ${pulled} 条远程证据，导入 ${imported} 条候选记录，请逐条确认。`
+      : "没有发现新的远程证据。";
+  } catch (reason) {
+    error.value = `拉取远程证据失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
 function formatRemotePairingStatus(status: string) {
   return ({ pending: "等待另一台设备", accepted: "已配对", revoked: "已撤销", expired: "已过期" } as Record<string, string>)[status] || status;
 }
@@ -333,6 +453,11 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
           <Button label="接受配对" icon="pi pi-link" severity="secondary" outlined :loading="remoteBusy === 'claim'" :disabled="Boolean(remoteBusy) || remoteClaimCode.length !== 10" @click="claimPairing" />
           <Button label="刷新" icon="pi pi-refresh" severity="secondary" text :loading="remoteBusy === 'refresh'" :disabled="Boolean(remoteBusy)" @click="refreshRemoteSync" />
         </div>
+        <div class="remote-sync-actions">
+          <Button label="加密上传证据" icon="pi pi-cloud-upload" :loading="remoteBusy === 'push'" :disabled="Boolean(remoteBusy) || !evidenceTargetUin" @click="pushRemoteEvidence" />
+          <Button label="拉取并加入候选" icon="pi pi-cloud-download" severity="secondary" outlined :loading="remoteBusy === 'pull'" :disabled="Boolean(remoteBusy)" @click="pullRemoteEvidence" />
+          <small class="remote-sync-hint">上传/拉取使用上方填写的对方 QQ 号作为授权范围。</small>
+        </div>
         <div v-if="remoteInvitation" class="remote-invitation">
           <strong>本次配对码：{{ remoteInvitation.code }}</strong>
           <small>有效期至 {{ formatEvidenceTime(Date.parse(remoteInvitation.expiresAt) / 1000) }}</small>
@@ -405,6 +530,7 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
 .remote-sync-actions > .p-inputtext { min-width: 190px; flex: 1 1 210px; }
 .remote-sync-state { color: var(--muted); font-size: 11px; }
 .remote-sync-state .pi { margin-right: 4px; color: #169766; }
+.remote-sync-hint { flex: 1 1 100%; color: var(--muted); font-size: 11px; }
 .remote-pairing-panel { display: grid; gap: 10px; margin-top: 13px; margin-left: 55px; }
 .remote-code-input { max-width: 220px; letter-spacing: .08em; text-transform: uppercase; }
 .remote-invitation { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 11px 13px; color: var(--heading); background: var(--app-bg); border-radius: 10px; }

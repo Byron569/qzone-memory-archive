@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 export interface RemoteSyncConfig {
   endpoint?: string | null;
   deviceId?: string | null;
+  serverDeviceId?: string | null;
   label?: string | null;
   registered: boolean;
 }
@@ -102,6 +103,12 @@ export const decryptRemotePayload = (pairingId: string, peerPublicKey: string, c
   invoke<unknown>("decrypt_remote_payload", {
     request: { pairingId, peerPublicKey, change },
   });
+export const encryptRecoverySyncBatch = (request: {
+  pairingId: string;
+  peerPublicKey: string;
+  package: unknown;
+  observations: unknown[];
+}) => invoke<RemoteEncryptedChange[]>("encrypt_recovery_sync_batch", { request });
 export const pushRemoteChanges = (pairingId: string, changes: RemoteEncryptedChange[]) =>
   invoke<RemotePushResponse>("push_remote_changes", { pairingId, changes });
 export const pullRemoteChanges = (pairingId: string, cursor?: string, limit = 100) =>

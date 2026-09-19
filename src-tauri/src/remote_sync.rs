@@ -38,6 +38,7 @@ const PROTOCOL_VERSION: i32 = 1;
 pub struct RemoteSyncConfig {
     pub endpoint: Option<String>,
     pub device_id: Option<String>,
+    pub server_device_id: Option<String>,
     pub label: Option<String>,
     pub registered: bool,
 }
@@ -162,6 +163,15 @@ pub struct DecryptRemotePayloadRequest {
     change: RemoteEncryptedChange,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptRemoteBatchRequest {
+    pairing_id: String,
+    peer_public_key: String,
+    package: serde_json::Value,
+    observations: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct PushChangesRequest<'a> {
     changes: &'a [RemoteEncryptedChange],
@@ -228,6 +238,7 @@ struct ClaimPairingRequest {
 pub fn get_remote_sync_config() -> Result<RemoteSyncConfig, String> {
     let endpoint = read_secret(ENDPOINT_ACCOUNT)?;
     let device_id = read_secret(DEVICE_ID_ACCOUNT)?;
+    let server_device_id = read_secret(SERVER_DEVICE_ID_ACCOUNT)?;
     let label = read_secret(DEVICE_LABEL_ACCOUNT)?;
     let registered = read_secret(DEVICE_TOKEN_ACCOUNT)?.is_some()
         && read_secret(DEVICE_PRIVATE_KEY_ACCOUNT)?.is_some()
@@ -235,6 +246,7 @@ pub fn get_remote_sync_config() -> Result<RemoteSyncConfig, String> {
     Ok(RemoteSyncConfig {
         endpoint,
         device_id,
+        server_device_id,
         label,
         registered,
     })
@@ -487,6 +499,50 @@ pub fn decrypt_remote_payload(
         )
         .map_err(|_| "同步记录解密失败，可能来自其他配对或已被篡改".to_string())?;
     serde_json::from_slice(&plaintext).map_err(|_| "同步记录内容不是有效 JSON".to_string())
+}
+
+#[tauri::command]
+pub fn encrypt_recovery_sync_batch(
+    request: EncryptRemoteBatchRequest,
+) -> Result<Vec<RemoteEncryptedChange>, String> {
+    if request.observations.is_empty() || request.observations.len() > 100 {
+        return Err("每批加密记录需要包含 1 到 100 条".into());
+    }
+    let package_id = request
+        .package
+        .get("packageId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "同步证据包缺少编号".to_string())?
+        .to_owned();
+    let mut changes = Vec::with_capacity(request.observations.len());
+    for observation in request.observations {
+        let record_id = observation
+            .get("eventKey")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "同步证据记录缺少稳定编号".to_string())?
+            .to_owned();
+        let payload = serde_json::json!({
+            "schemaVersion": request.package.get("schemaVersion").cloned().unwrap_or(serde_json::Value::from(PROTOCOL_VERSION)),
+            "packageId": package_id,
+            "exporterUin": request.package.get("exporterUin"),
+            "targetUin": request.package.get("targetUin"),
+            "createdAt": request.package.get("createdAt"),
+            "observation": observation,
+        });
+        changes.push(encrypt_remote_payload(EncryptRemotePayloadRequest {
+            pairing_id: request.pairing_id.clone(),
+            peer_public_key: request.peer_public_key.clone(),
+            record_id,
+            operation: "upsert".into(),
+            revision: 1,
+            key_version: 1,
+            payload,
+            deleted_at: None,
+        })?);
+    }
+    Ok(changes)
 }
 
 fn derive_pairing_key(pairing_id: &str, peer_public_key: &str) -> Result<[u8; 32], String> {
