@@ -91,13 +91,16 @@ struct DeviceResponse {
 #[derive(Debug, Deserialize)]
 struct ClaimPairingRequest {
     code: String,
+    invitee_public_key: String,
 }
 
 #[derive(Debug, Serialize, FromRow)]
 struct PairingResponse {
     id: Uuid,
     initiator_device_id: Uuid,
+    initiator_public_key: Option<String>,
     claimant_device_id: Option<Uuid>,
+    claimant_public_key: Option<String>,
     status: String,
     expires_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
@@ -109,6 +112,8 @@ struct CreatePairingResponse {
     pairing_id: Uuid,
     code: String,
     expires_at: DateTime<Utc>,
+    initiator_device_id: Uuid,
+    initiator_public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,11 +355,13 @@ async fn create_pairing(
     let expires_at = Utc::now() + Duration::minutes(15);
 
     sqlx::query(
-        "INSERT INTO pairings (id, initiator_device_id, code_hash, status, expires_at)
-         VALUES ($1, $2, $3, 'pending', $4)",
+        "INSERT INTO pairings (
+             id, initiator_device_id, initiator_public_key, code_hash, status, expires_at
+         ) VALUES ($1, $2, $3, $4, 'pending', $5)",
     )
     .bind(pairing_id)
     .bind(device.id)
+    .bind(&device.public_key)
     .bind(hash_secret(&code))
     .bind(expires_at)
     .execute(&state.pool)
@@ -366,6 +373,8 @@ async fn create_pairing(
             pairing_id,
             code,
             expires_at,
+            initiator_device_id: device.id,
+            initiator_public_key: device.public_key,
         }),
     ))
 }
@@ -376,6 +385,7 @@ async fn claim_pairing(
     Json(request): Json<ClaimPairingRequest>,
 ) -> ApiResult<Json<PairingResponse>> {
     let claimant = authenticate(&headers, &state.pool).await?;
+    validate_public_key(&request.invitee_public_key)?;
     let code = request.code.trim().to_uppercase();
     if code.len() != 10 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "配对码格式无效"));
@@ -383,7 +393,8 @@ async fn claim_pairing(
 
     let mut transaction = state.pool.begin().await?;
     let pairing = sqlx::query_as::<_, PairingResponse>(
-        "SELECT id, initiator_device_id, claimant_device_id, status, expires_at, created_at, accepted_at
+        "SELECT id, initiator_device_id, initiator_public_key, claimant_device_id,
+                claimant_public_key, status, expires_at, created_at, accepted_at
          FROM pairings
          WHERE code_hash = $1
          FOR UPDATE",
@@ -406,11 +417,14 @@ async fn claim_pairing(
     let accepted_at = Utc::now();
     let updated = sqlx::query_as::<_, PairingResponse>(
         "UPDATE pairings
-         SET claimant_device_id = $1, status = 'accepted', accepted_at = $2
-         WHERE id = $3
-         RETURNING id, initiator_device_id, claimant_device_id, status, expires_at, created_at, accepted_at",
+         SET claimant_device_id = $1, claimant_public_key = $2,
+             status = 'accepted', accepted_at = $3
+         WHERE id = $4
+         RETURNING id, initiator_device_id, initiator_public_key, claimant_device_id,
+                   claimant_public_key, status, expires_at, created_at, accepted_at",
     )
     .bind(claimant.id)
+    .bind(&request.invitee_public_key)
     .bind(accepted_at)
     .bind(pairing.id)
     .fetch_one(&mut *transaction)
@@ -434,7 +448,8 @@ async fn list_pairings(
 ) -> ApiResult<Json<PairingListResponse>> {
     let device = authenticate(&headers, &state.pool).await?;
     let pairings = sqlx::query_as::<_, PairingResponse>(
-        "SELECT id, initiator_device_id, claimant_device_id, status, expires_at, created_at, accepted_at
+        "SELECT id, initiator_device_id, initiator_public_key, claimant_device_id,
+                claimant_public_key, status, expires_at, created_at, accepted_at
          FROM pairings
          WHERE initiator_device_id = $1 OR claimant_device_id = $1
          ORDER BY created_at DESC",
@@ -859,15 +874,27 @@ fn validate_device_request(request: &RegisterDeviceRequest) -> ApiResult<()> {
     if request.device_id.trim().is_empty() || request.device_id.len() > 128 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备标识无效"));
     }
-    if request.public_key.trim().is_empty() || request.public_key.len() > 4096 {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备公钥无效"));
-    }
+    validate_public_key(&request.public_key)?;
     if request
         .label
         .as_ref()
         .is_some_and(|label| label.len() > 128)
     {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备名称过长"));
+    }
+    Ok(())
+}
+
+fn validate_public_key(public_key: &str) -> ApiResult<()> {
+    let value = public_key.trim();
+    if value.is_empty() || value.len() > 4096 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备公钥无效"));
+    }
+    // The current desktop client uses a base64 encoded X25519 public key.
+    // Keep the validation deliberately compatible with future key formats,
+    // while rejecting whitespace and obviously malformed values.
+    if value.chars().any(char::is_whitespace) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备公钥格式无效"));
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 mod archive;
 mod qlogin;
 mod qzone;
+mod remote_sync;
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
@@ -28,6 +29,18 @@ pub fn run() {
             qlogin::open_web_login,
             qlogin::check_web_login,
             qlogin::sync_cookies_to_webview,
+            remote_sync::get_remote_sync_config,
+            remote_sync::save_remote_sync_endpoint,
+            remote_sync::register_remote_device,
+            remote_sync::create_remote_pairing,
+            remote_sync::claim_remote_pairing,
+            remote_sync::list_remote_pairings,
+            remote_sync::encrypt_remote_payload,
+            remote_sync::decrypt_remote_payload,
+            remote_sync::push_remote_changes,
+            remote_sync::pull_remote_changes,
+            remote_sync::ack_remote_changes,
+            remote_sync::clear_remote_sync_credentials,
             qzone::fetch_first_feeds,
             qzone::fetch_more_feeds,
             qzone::open_recycle_password_window,

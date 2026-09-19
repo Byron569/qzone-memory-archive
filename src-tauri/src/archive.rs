@@ -4351,6 +4351,10 @@ pub async fn delete_all_app_data(
 ) -> Result<(), String> {
     ensure_archive_idle(&state)?;
     login.clear_session().await;
+    // Remote sync credentials live only in the OS credential store. A full
+    // app-data wipe must remove them as well; on unsupported mobile keyrings
+    // this is a harmless no-op.
+    let _ = crate::remote_sync::clear_remote_sync_credentials();
     let database = database_path(&app)?;
     for path in [
         database.clone(),

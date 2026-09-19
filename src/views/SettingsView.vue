@@ -11,6 +11,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
 import { deleteAllAppData, exportRecoveryEvidence, importRecoveryEvidence, listRecoveryEvidenceCandidates, listRecoveryEvidencePackages, mergeRecoveryEvidenceItem, type RecoveryEvidenceCandidate, type RecoveryEvidencePackageSummary } from "../utils/qzone";
+import { claimRemotePairing, createRemotePairing, getRemoteSyncConfig, listRemotePairings, registerRemoteDevice, saveRemoteSyncEndpoint, type RemotePairing, type RemotePairingInvitation, type RemoteSyncConfig } from "../utils/remoteSync";
 
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
@@ -30,6 +31,15 @@ const candidatesLoading = ref(false);
 const candidateBusy = ref<number | null>(null);
 const candidateConfirmVisible = ref(false);
 const selectedCandidate = ref<RecoveryEvidenceCandidate | null>(null);
+const remoteConfig = ref<RemoteSyncConfig | null>(null);
+const remoteEndpoint = ref("");
+const remoteRegistrationToken = ref("");
+const remoteDeviceLabel = ref("");
+const remoteClaimCode = ref("");
+const remoteInvitation = ref<RemotePairingInvitation | null>(null);
+const remotePairings = ref<RemotePairing[]>([]);
+const remoteBusy = ref<"save" | "register" | "create" | "claim" | "refresh" | null>(null);
+const remoteNotice = ref("");
 
 const evidenceFilter = [{ name: "QQ 空间双端证据包", extensions: ["qzone-evidence", "json"] }];
 
@@ -69,6 +79,26 @@ async function refreshEvidenceCandidates() {
   }
 }
 
+async function refreshRemoteSync() {
+  remoteBusy.value = "refresh";
+  try {
+    remoteConfig.value = await getRemoteSyncConfig();
+    remoteEndpoint.value = remoteConfig.value.endpoint || remoteEndpoint.value;
+    remoteDeviceLabel.value = remoteConfig.value.label || remoteDeviceLabel.value;
+    if (remoteConfig.value.registered) {
+      remotePairings.value = await listRemotePairings();
+    } else {
+      remotePairings.value = [];
+    }
+  } catch (reason) {
+    // The settings page should remain usable if the system credential store
+    // is unavailable or the server has not been configured yet.
+    console.warn("读取远程同步状态失败", reason);
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
 onMounted(async () => {
   try {
     appVersion.value = await getVersion();
@@ -77,6 +107,7 @@ onMounted(async () => {
   }
   await refreshEvidencePackages();
   await refreshEvidenceCandidates();
+  await refreshRemoteSync();
 });
 
 watch(intervalMs, (value) => { intervalMs.value = setArchiveInterval(value); });
@@ -161,6 +192,73 @@ async function confirmCandidateMerge() {
   }
 }
 
+async function saveRemoteEndpoint() {
+  if (remoteBusy.value) return;
+  remoteBusy.value = "save";
+  remoteNotice.value = "";
+  try {
+    remoteConfig.value = await saveRemoteSyncEndpoint(remoteEndpoint.value);
+    remoteEndpoint.value = remoteConfig.value.endpoint || remoteEndpoint.value;
+    remoteNotice.value = "服务器地址已保存到系统安全凭据库。";
+  } catch (reason) {
+    error.value = `保存远程服务器地址失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
+async function registerRemote() {
+  if (remoteBusy.value) return;
+  remoteBusy.value = "register";
+  remoteNotice.value = "";
+  try {
+    const result = await registerRemoteDevice(remoteEndpoint.value, remoteRegistrationToken.value, remoteDeviceLabel.value);
+    remoteRegistrationToken.value = "";
+    remoteConfig.value = await getRemoteSyncConfig();
+    remotePairings.value = await listRemotePairings();
+    remoteNotice.value = `设备注册成功（设备 ${result.deviceId.slice(0, 8)}…）。注册令牌不会保存在应用数据库或前端存储中。`;
+  } catch (reason) {
+    error.value = `注册远程设备失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
+async function createPairing() {
+  if (remoteBusy.value) return;
+  remoteBusy.value = "create";
+  remoteNotice.value = "";
+  try {
+    remoteInvitation.value = await createRemotePairing();
+    remoteNotice.value = "配对邀请已创建。请把 10 位配对码交给另一台经过授权的设备。";
+    remotePairings.value = await listRemotePairings();
+  } catch (reason) {
+    error.value = `创建配对邀请失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
+async function claimPairing() {
+  if (remoteBusy.value) return;
+  remoteBusy.value = "claim";
+  remoteNotice.value = "";
+  try {
+    await claimRemotePairing(remoteClaimCode.value);
+    remoteClaimCode.value = "";
+    remotePairings.value = await listRemotePairings();
+    remoteNotice.value = "配对成功。双方公钥已交换，下一步即可建立客户端加密同步。";
+  } catch (reason) {
+    error.value = `接受配对邀请失败：${String(reason)}`;
+  } finally {
+    remoteBusy.value = null;
+  }
+}
+
+function formatRemotePairingStatus(status: string) {
+  return ({ pending: "等待另一台设备", accepted: "已配对", revoked: "已撤销", expired: "已过期" } as Record<string, string>)[status] || status;
+}
+
 function candidateLabel(candidate: RecoveryEvidenceCandidate) {
   return candidate.originalAuthorName || candidate.actorName || candidate.originalAuthorUin || candidate.actorUin || "未知账号";
 }
@@ -215,6 +313,40 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
       <small v-if="candidateTotal > evidenceCandidates.length" class="candidate-more">仅显示前 {{ evidenceCandidates.length }} 条，请先处理当前候选。</small>
     </article>
 
+    <article class="surface-card settings-card remote-sync-setting">
+      <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-cloud-upload" /></span><div><h3>远程双端同步</h3><p>通过你自己的服务器交换两台设备的加密证据。服务器只保存密文、摘要和游标，不保存 QQ Cookie。</p></div></div>
+      <div class="remote-sync-form">
+        <InputText v-model.trim="remoteEndpoint" placeholder="服务器地址，例如 http://127.0.0.1:8787" aria-label="远程同步服务器地址" />
+        <InputText v-model.trim="remoteDeviceLabel" placeholder="设备名称（可选）" aria-label="设备名称" />
+        <div class="remote-sync-actions">
+          <Button label="保存地址" icon="pi pi-save" severity="secondary" outlined :loading="remoteBusy === 'save'" :disabled="Boolean(remoteBusy) || !remoteEndpoint" @click="saveRemoteEndpoint" />
+          <InputText v-model="remoteRegistrationToken" type="password" placeholder="首次注册令牌" aria-label="首次注册令牌" autocomplete="off" />
+          <Button label="注册本设备" icon="pi pi-key" :loading="remoteBusy === 'register'" :disabled="Boolean(remoteBusy) || !remoteEndpoint || remoteRegistrationToken.length < 24" @click="registerRemote" />
+        </div>
+        <small v-if="remoteConfig?.registered" class="remote-sync-state"><i class="pi pi-check-circle" /> 本设备已注册，可创建或接受配对。</small>
+        <small v-else class="remote-sync-state"><i class="pi pi-info-circle" /> 先保存服务器地址，再输入管理员提供的注册令牌完成一次注册。</small>
+      </div>
+      <div v-if="remoteConfig?.registered" class="remote-pairing-panel">
+        <div class="remote-sync-actions">
+          <Button label="创建配对码" icon="pi pi-plus" :loading="remoteBusy === 'create'" :disabled="Boolean(remoteBusy)" @click="createPairing" />
+          <InputText v-model.trim="remoteClaimCode" class="remote-code-input" placeholder="输入对方的 10 位配对码" aria-label="配对码" maxlength="10" />
+          <Button label="接受配对" icon="pi pi-link" severity="secondary" outlined :loading="remoteBusy === 'claim'" :disabled="Boolean(remoteBusy) || remoteClaimCode.length !== 10" @click="claimPairing" />
+          <Button label="刷新" icon="pi pi-refresh" severity="secondary" text :loading="remoteBusy === 'refresh'" :disabled="Boolean(remoteBusy)" @click="refreshRemoteSync" />
+        </div>
+        <div v-if="remoteInvitation" class="remote-invitation">
+          <strong>本次配对码：{{ remoteInvitation.code }}</strong>
+          <small>有效期至 {{ formatEvidenceTime(Date.parse(remoteInvitation.expiresAt) / 1000) }}</small>
+        </div>
+        <div v-if="remotePairings.length" class="remote-pairing-list">
+          <div v-for="pairing in remotePairings" :key="pairing.pairingId" class="remote-pairing-row">
+            <span><i class="pi pi-link" /> {{ pairing.pairingId.slice(0, 8) }}…</span>
+            <small>{{ formatRemotePairingStatus(pairing.status) }}</small>
+          </div>
+        </div>
+      </div>
+    </article>
+    <p v-if="remoteNotice" class="evidence-notice"><i class="pi pi-check-circle" />{{ remoteNotice }}</p>
+
     <article class="surface-card settings-card">
       <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-shield" /></span><div><h3>隐私协议</h3><p>了解登录凭证、归档内容和网络请求的处理方式。</p></div></div>
       <Button label="查看协议" icon="pi pi-angle-right" icon-pos="right" severity="secondary" text @click="privacyVisible = true" />
@@ -267,6 +399,19 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
 .evidence-summary { margin-top: 5px !important; font-size: 11px !important; }
 .evidence-notice { display: flex; align-items: center; gap: 8px; margin: 0; padding: 11px 14px; color: #16875d; background: #edfff6; border: 1px solid #c7f4dd; border-radius: 11px; font-size: 13px; }
 .candidate-setting { display: block; }
+.remote-sync-setting { display: block; }
+.remote-sync-form { display: grid; gap: 10px; width: min(100%, 620px); margin-top: 14px; margin-left: 55px; }
+.remote-sync-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.remote-sync-actions > .p-inputtext { min-width: 190px; flex: 1 1 210px; }
+.remote-sync-state { color: var(--muted); font-size: 11px; }
+.remote-sync-state .pi { margin-right: 4px; color: #169766; }
+.remote-pairing-panel { display: grid; gap: 10px; margin-top: 13px; margin-left: 55px; }
+.remote-code-input { max-width: 220px; letter-spacing: .08em; text-transform: uppercase; }
+.remote-invitation { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; padding: 11px 13px; color: var(--heading); background: var(--app-bg); border-radius: 10px; }
+.remote-invitation strong { letter-spacing: .16em; }
+.remote-invitation small, .remote-pairing-row small { color: var(--muted); }
+.remote-pairing-list { display: grid; gap: 6px; }
+.remote-pairing-row { display: flex; justify-content: space-between; padding: 8px 10px; color: var(--heading); background: var(--app-bg); border-radius: 8px; font-size: 12px; }
 .candidate-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 12px; }
 .candidate-count { margin-right: auto; color: var(--text-color-secondary, #64748b); font-size: 12px; }
 .candidate-list { display: grid; gap: 8px; margin-top: 4px; }
@@ -286,5 +431,8 @@ function candidatePreview(candidate: RecoveryEvidenceCandidate) {
   .evidence-actions .p-button { flex: 1 1 170px; }
   .candidate-row { align-items: flex-start; flex-direction: column; }
   .candidate-row .p-button { width: 100%; }
+  .remote-sync-form, .remote-pairing-panel { width: 100%; margin-left: 0; }
+  .remote-sync-actions > .p-inputtext { min-width: 0; flex-basis: 100%; }
+  .remote-sync-actions .p-button { flex: 1 1 160px; }
 }
 </style>
