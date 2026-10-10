@@ -50,7 +50,7 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 ## 下载与安装
 
-请从本仓库的 [Releases](https://github.com/Byron569/qzone-memory-archive/releases) 下载与系统匹配的安装包：
+请从[项目官网](https://byron569.online/qzone/#downloads)或本仓库的 [Releases](https://github.com/Byron569/qzone-memory-archive/releases) 下载与系统匹配的安装包：
 
 - Windows：NSIS 安装程序（`.exe`）
 - macOS：Intel `x64` 或 Apple 芯片 `aarch64` 安装镜像（`.dmg`）
